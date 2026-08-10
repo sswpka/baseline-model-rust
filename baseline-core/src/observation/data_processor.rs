@@ -166,6 +166,18 @@ impl ObservationDataProcessor {
     /// `RefreshDSSDPlots`/`RefreshBGOPlots` in the original WPF code-behind,
     /// minus the dynamic bin-range and curve-fitting logic (deferred - see
     /// module notes).
+    ///
+    /// Every particle contributes a pulse-height entry to every DSSD/BGO
+    /// layer regardless of whether that layer actually fired (see
+    /// `process_dssd_layer`/`process_bgo_layer`), so most particles record a
+    /// `0` in the layers they didn't hit. The main X/Y and BGO histograms
+    /// drop those zeros (`histogram_of_positive`), matching the original's
+    /// `PlotHistogram`/`PlotBGOHistogram` (`data.Where(v => v > 0)`) -
+    /// otherwise channel 0 accumulates a massive non-physical spike that
+    /// wins every peak search and gets handed to the Gaussian/Lorentzian fit
+    /// instead of the real photopeak. Strip histograms intentionally keep
+    /// zeros, matching `PlotStripHistogram`'s `v >= xMin` filter (default
+    /// `xMin = 0`).
     fn get_histogram_data(&self) -> HashMap<String, Vec<i32>> {
         let mut result = HashMap::new();
 
@@ -173,8 +185,8 @@ impl ObservationDataProcessor {
             let data = &self.dssd_data[&layer];
             let name = layer_name(layer);
 
-            result.insert(format!("DSSD{name}_X"), histogram_of(&data.pulse_height_x));
-            result.insert(format!("DSSD{name}_Y"), histogram_of(&data.pulse_height_y));
+            result.insert(format!("DSSD{name}_X"), histogram_of_positive(&data.pulse_height_x));
+            result.insert(format!("DSSD{name}_Y"), histogram_of_positive(&data.pulse_height_y));
 
             for strip in 1..=8 {
                 let empty = Vec::new();
@@ -188,8 +200,8 @@ impl ObservationDataProcessor {
         for layer in [BgoLayer::L3, BgoLayer::L4, BgoLayer::L5] {
             let data = &self.bgo_data[&layer];
             let name = bgo_layer_name(layer);
-            result.insert(format!("BGO{name}_High"), histogram_of(&data.high_gain));
-            result.insert(format!("BGO{name}_Low"), histogram_of(&data.low_gain));
+            result.insert(format!("BGO{name}_High"), histogram_of_positive(&data.high_gain));
+            result.insert(format!("BGO{name}_Low"), histogram_of_positive(&data.low_gain));
         }
 
         result
@@ -317,11 +329,13 @@ fn bgo_layer_name(layer: BgoLayer) -> &'static str {
     }
 }
 
-fn histogram_of(values: &[f64]) -> Vec<i32> {
+/// Excludes non-positive values - see `get_histogram_data`'s doc comment
+/// for why this matters for the main DSSD X/Y and BGO histograms.
+fn histogram_of_positive(values: &[f64]) -> Vec<i32> {
     let mut hist = vec![0i32; HISTOGRAM_SIZE];
     for &value in values {
         let idx = value as i64;
-        if idx >= 0 && (idx as usize) < HISTOGRAM_SIZE {
+        if idx > 0 && (idx as usize) < HISTOGRAM_SIZE {
             hist[idx as usize] += 1;
         }
     }

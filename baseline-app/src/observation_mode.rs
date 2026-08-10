@@ -1,7 +1,7 @@
 //! Port of Observation mode (`ObservationViewModel` + `.Commands.cs` +
 //! `.FileOperations.cs`). Deferred (see project notes): the
-//! `ObservationDetailWindow` (per-histogram peak-locking), the dynamic
-//! X-min/max rebinning, and the BGO adaptive/Kalman/Z-score filters - this
+//! `ObservationDetailWindow` (per-histogram peak-locking), and the BGO
+//! adaptive/Kalman/Z-score filters - this
 //! covers file ingestion, Excel export, and the DSSD pulse-height/strip and
 //! BGO gain histograms that `AnalyzeFiles`/`ObservationDataProcessor`
 //! actually compute, switchable via the DSSD/X-Strip/Y-Strip/BGO view-mode
@@ -67,6 +67,15 @@ pub struct ObservationMode {
     selected_bgo_layer: BgoLayer,
     histogram_data: HashMap<String, Vec<i32>>,
 
+    /// Mirrors the original's `TxtDSSDXMin`/`TxtDSSDXMax` textboxes: raw
+    /// text so the field can be edited freely (including transiently
+    /// empty/invalid states) while typing. Applied to the DSSD Pulse
+    /// Height/X-Strip/Y-Strip views only, matching the original's shared
+    /// per-tab textboxes. Left blank (or unparsable/inverted), the view
+    /// shows the full channel range - same as before this control existed.
+    dssd_x_min: String,
+    dssd_x_max: String,
+
     show_gaussian_fit: bool,
     show_lorentzian_fit: bool,
     show_hemg_fit: bool,
@@ -102,6 +111,8 @@ impl Default for ObservationMode {
             selected_layer: DetectorLayer::L1,
             selected_bgo_layer: BgoLayer::L3,
             histogram_data: HashMap::new(),
+            dssd_x_min: String::new(),
+            dssd_x_max: String::new(),
             show_gaussian_fit: true,
             show_lorentzian_fit: false,
             show_hemg_fit: false,
@@ -177,6 +188,15 @@ impl ObservationMode {
                                 ui.selectable_value(&mut self.selected_layer, layer, format!("{layer:?}"));
                             }
                         });
+
+                    ui.label("X Min:");
+                    ui.add(egui::TextEdit::singleline(&mut self.dssd_x_min).desired_width(60.0));
+                    ui.label("X Max:");
+                    ui.add(egui::TextEdit::singleline(&mut self.dssd_x_max).desired_width(60.0));
+                    if ui.button("Clear Range").clicked() {
+                        self.dssd_x_min.clear();
+                        self.dssd_x_max.clear();
+                    }
                 }
             });
 
@@ -218,16 +238,27 @@ impl ObservationMode {
         }
     }
 
+    /// Parses `dssd_x_min`/`dssd_x_max` into an active view range, mirroring
+    /// the original's `TxtDSSDXMin`/`TxtDSSDXMax`-driven zoom in
+    /// `PlotHistogram`/`PlotStripHistogram`. Returns `None` (full range,
+    /// today's behavior) unless both fields hold a valid `min < max` pair.
+    fn dssd_x_range(&self) -> Option<(f64, f64)> {
+        let min = self.dssd_x_min.trim().parse::<f64>().ok()?;
+        let max = self.dssd_x_max.trim().parse::<f64>().ok()?;
+        (max > min).then_some((min, max))
+    }
+
     fn dssd_pulse_height_ui(&mut self, ui: &mut egui::Ui, export: &mut crate::plot_export::PlotExportQueue) {
         let layer_name = format!("{:?}", self.selected_layer);
         let x_key = format!("DSSD{layer_name}_X");
         let y_key = format!("DSSD{layer_name}_Y");
+        let x_range = self.dssd_x_range();
 
         ui.label(format!("{layer_name} - Pulse Height X"));
-        self.histogram_plot(ui, &x_key, "obs_x_plot", export);
+        self.histogram_plot(ui, &x_key, "obs_x_plot", x_range, export);
         ui.separator();
         ui.label(format!("{layer_name} - Pulse Height Y"));
-        self.histogram_plot(ui, &y_key, "obs_y_plot", export);
+        self.histogram_plot(ui, &y_key, "obs_y_plot", x_range, export);
     }
 
     /// `axis` is `'X'` or `'Y'`, selecting the X-Strip or Y-Strip view.
@@ -235,13 +266,14 @@ impl ObservationMode {
         let layer_name = format!("{:?}", self.selected_layer);
         ui.label(format!("{layer_name} - {axis}-Strip Pulse Height (1-8)"));
         ui.separator();
+        let x_range = self.dssd_x_range();
 
         ui.columns(2, |cols| {
             for strip in 1..=8 {
                 let key = format!("DSSD{layer_name}_Strip{axis}{strip}");
                 let col = &mut cols[(strip - 1) % 2];
                 col.label(format!("Strip {axis}{strip}"));
-                self.strip_bar_plot(col, &key, &format!("obs_strip_{axis}{strip}"), export);
+                self.strip_bar_plot(col, &key, &format!("obs_strip_{axis}{strip}"), x_range, export);
                 col.separator();
             }
         });
@@ -254,29 +286,33 @@ impl ObservationMode {
 
         ui.columns(2, |cols| {
             cols[0].label(format!("{layer_name} - BGO High Gain"));
-            self.strip_bar_plot(&mut cols[0], &high_key, "obs_bgo_high", export);
+            self.strip_bar_plot(&mut cols[0], &high_key, "obs_bgo_high", None, export);
             cols[1].label(format!("{layer_name} - BGO Low Gain"));
-            self.strip_bar_plot(&mut cols[1], &low_key, "obs_bgo_low", export);
+            self.strip_bar_plot(&mut cols[1], &low_key, "obs_bgo_low", None, export);
         });
     }
 
-    fn histogram_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, export: &mut crate::plot_export::PlotExportQueue) {
-        self.histogram_plot_sized(ui, key, id, 260.0, export);
+    fn histogram_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, x_range: Option<(f64, f64)>, export: &mut crate::plot_export::PlotExportQueue) {
+        self.histogram_plot_sized(ui, key, id, 260.0, x_range, export);
     }
 
     /// Bar-chart rendering (one bar per raw ADC channel, matching the
     /// original's `AddBar(hist, binMidpoints)`) at a configurable height,
     /// with any enabled Gaussian/Lorentzian/HEMG fits overlaid as line
     /// curves on top (mirrors the `PlotStripHistogram`/`PlotBGOHistogram`
-    /// bar+fit rendering, minus the dynamic X-min/max rebinning -
-    /// deferred, see module notes). Zero-count channels are skipped: they
-    /// draw nothing anyway, and real data only ever populates a narrow
-    /// window of the 16384-channel range, so this keeps the draw count
-    /// small without changing what's visible.
-    fn histogram_plot_sized(&mut self, ui: &mut egui::Ui, key: &str, id: &str, height: f32, export: &mut crate::plot_export::PlotExportQueue) {
+    /// bar+fit rendering). `x_range`, when set (see `dssd_x_range`),
+    /// restricts both the bars and the fit curve to `[min, max]` - mirroring
+    /// the original's `TxtDSSDXMin`/`TxtDSSDXMax`-driven zoom - by leaving
+    /// out-of-range points out of what's drawn, so the plot's auto-bounds
+    /// settle on that window. Zero-count channels are skipped: they draw
+    /// nothing anyway, and real data only ever populates a narrow window of
+    /// the 16384-channel range, so this keeps the draw count small without
+    /// changing what's visible.
+    fn histogram_plot_sized(&mut self, ui: &mut egui::Ui, key: &str, id: &str, height: f32, x_range: Option<(f64, f64)>, export: &mut crate::plot_export::PlotExportQueue) {
         self.ensure_fits(key);
         let hist = self.histogram_data.get(key);
         let fits = self.fit_cache.get(key);
+        let in_range = |x: f64| x_range.map_or(true, |(lo, hi)| x >= lo && x <= hi);
 
         let plot = Plot::new(id).height(height).legend(Legend::default());
         crate::plot_export::show(ui, export, id, id, plot, |plot_ui| {
@@ -284,23 +320,29 @@ impl ObservationMode {
                 let bars: Vec<Bar> = hist
                     .iter()
                     .enumerate()
-                    .filter(|&(_, &c)| c > 0)
+                    .filter(|&(x, &c)| c > 0 && in_range(x as f64))
                     .map(|(x, &c)| Bar::new(x as f64, c as f64).width(1.0).fill(Color32::LIGHT_BLUE))
                     .collect();
                 plot_ui.bar_chart(BarChart::new(bars).name("Data"));
             }
             if let Some(fits) = fits {
                 for fit in fits {
-                    let points: PlotPoints =
-                        fit.curve.iter().enumerate().map(|(i, &y)| [(fit.start + i) as f64, y]).collect();
+                    let points: PlotPoints = fit
+                        .curve
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &y)| ((fit.start + i) as f64, y))
+                        .filter(|&(x, _)| in_range(x))
+                        .map(|(x, y)| [x, y])
+                        .collect();
                     plot_ui.line(Line::new(points).name(&fit.label).color(fit.color));
                 }
             }
         });
     }
 
-    fn strip_bar_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, export: &mut crate::plot_export::PlotExportQueue) {
-        self.histogram_plot_sized(ui, key, id, 180.0, export);
+    fn strip_bar_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, x_range: Option<(f64, f64)>, export: &mut crate::plot_export::PlotExportQueue) {
+        self.histogram_plot_sized(ui, key, id, 180.0, x_range, export);
 
         let hist = self.histogram_data.get(key);
         let counts: i64 = hist.map(|h| h.iter().map(|&c| c as i64).sum()).unwrap_or(0);
@@ -333,7 +375,7 @@ impl ObservationMode {
     /// curve (`vec![0.0; 16384]` outside the peak) would blow out the
     /// plot's auto-bounds and squash the populated-channels-only bar chart
     /// down to a sliver.
-    const FIT_WINDOW: usize = 150;
+    const FIT_WINDOW: usize = 100;
 
     fn compute_fits(&self, key: &str) -> Vec<ObsFitCurve> {
         if !(self.show_gaussian_fit || self.show_lorentzian_fit || self.show_hemg_fit) {

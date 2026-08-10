@@ -114,7 +114,7 @@ impl Default for ObservationMode {
 }
 
 impl ObservationMode {
-    pub fn update(&mut self, ctx: &egui::Context) {
+    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
         self.drain_messages();
 
         egui::TopBottomPanel::top("observation_top").show(ctx, |ui| {
@@ -206,10 +206,10 @@ impl ObservationMode {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.view_mode {
-                ObservationViewMode::DssdPulseHeight => self.dssd_pulse_height_ui(ui),
-                ObservationViewMode::XStrip => self.strip_grid_ui(ui, 'X'),
-                ObservationViewMode::YStrip => self.strip_grid_ui(ui, 'Y'),
-                ObservationViewMode::Bgo => self.bgo_ui(ui),
+                ObservationViewMode::DssdPulseHeight => self.dssd_pulse_height_ui(ui, export),
+                ObservationViewMode::XStrip => self.strip_grid_ui(ui, 'X', export),
+                ObservationViewMode::YStrip => self.strip_grid_ui(ui, 'Y', export),
+                ObservationViewMode::Bgo => self.bgo_ui(ui, export),
             });
         });
 
@@ -218,20 +218,20 @@ impl ObservationMode {
         }
     }
 
-    fn dssd_pulse_height_ui(&mut self, ui: &mut egui::Ui) {
+    fn dssd_pulse_height_ui(&mut self, ui: &mut egui::Ui, export: &mut crate::plot_export::PlotExportQueue) {
         let layer_name = format!("{:?}", self.selected_layer);
         let x_key = format!("DSSD{layer_name}_X");
         let y_key = format!("DSSD{layer_name}_Y");
 
         ui.label(format!("{layer_name} - Pulse Height X"));
-        self.histogram_plot(ui, &x_key, "obs_x_plot");
+        self.histogram_plot(ui, &x_key, "obs_x_plot", export);
         ui.separator();
         ui.label(format!("{layer_name} - Pulse Height Y"));
-        self.histogram_plot(ui, &y_key, "obs_y_plot");
+        self.histogram_plot(ui, &y_key, "obs_y_plot", export);
     }
 
     /// `axis` is `'X'` or `'Y'`, selecting the X-Strip or Y-Strip view.
-    fn strip_grid_ui(&mut self, ui: &mut egui::Ui, axis: char) {
+    fn strip_grid_ui(&mut self, ui: &mut egui::Ui, axis: char, export: &mut crate::plot_export::PlotExportQueue) {
         let layer_name = format!("{:?}", self.selected_layer);
         ui.label(format!("{layer_name} - {axis}-Strip Pulse Height (1-8)"));
         ui.separator();
@@ -241,27 +241,27 @@ impl ObservationMode {
                 let key = format!("DSSD{layer_name}_Strip{axis}{strip}");
                 let col = &mut cols[(strip - 1) % 2];
                 col.label(format!("Strip {axis}{strip}"));
-                self.strip_bar_plot(col, &key, &format!("obs_strip_{axis}{strip}"));
+                self.strip_bar_plot(col, &key, &format!("obs_strip_{axis}{strip}"), export);
                 col.separator();
             }
         });
     }
 
-    fn bgo_ui(&mut self, ui: &mut egui::Ui) {
+    fn bgo_ui(&mut self, ui: &mut egui::Ui, export: &mut crate::plot_export::PlotExportQueue) {
         let layer_name = format!("{:?}", self.selected_bgo_layer);
         let high_key = format!("BGO{layer_name}_High");
         let low_key = format!("BGO{layer_name}_Low");
 
         ui.columns(2, |cols| {
             cols[0].label(format!("{layer_name} - BGO High Gain"));
-            self.strip_bar_plot(&mut cols[0], &high_key, "obs_bgo_high");
+            self.strip_bar_plot(&mut cols[0], &high_key, "obs_bgo_high", export);
             cols[1].label(format!("{layer_name} - BGO Low Gain"));
-            self.strip_bar_plot(&mut cols[1], &low_key, "obs_bgo_low");
+            self.strip_bar_plot(&mut cols[1], &low_key, "obs_bgo_low", export);
         });
     }
 
-    fn histogram_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str) {
-        self.histogram_plot_sized(ui, key, id, 260.0);
+    fn histogram_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, export: &mut crate::plot_export::PlotExportQueue) {
+        self.histogram_plot_sized(ui, key, id, 260.0, export);
     }
 
     /// Bar-chart rendering (one bar per raw ADC channel, matching the
@@ -273,13 +273,13 @@ impl ObservationMode {
     /// draw nothing anyway, and real data only ever populates a narrow
     /// window of the 16384-channel range, so this keeps the draw count
     /// small without changing what's visible.
-    fn histogram_plot_sized(&mut self, ui: &mut egui::Ui, key: &str, id: &str, height: f32) {
+    fn histogram_plot_sized(&mut self, ui: &mut egui::Ui, key: &str, id: &str, height: f32, export: &mut crate::plot_export::PlotExportQueue) {
         self.ensure_fits(key);
         let hist = self.histogram_data.get(key);
         let fits = self.fit_cache.get(key);
 
         let plot = Plot::new(id).height(height).legend(Legend::default());
-        plot.show(ui, |plot_ui| {
+        crate::plot_export::show(ui, export, id, id, plot, |plot_ui| {
             if let Some(hist) = hist {
                 let bars: Vec<Bar> = hist
                     .iter()
@@ -299,8 +299,8 @@ impl ObservationMode {
         });
     }
 
-    fn strip_bar_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str) {
-        self.histogram_plot_sized(ui, key, id, 180.0);
+    fn strip_bar_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, export: &mut crate::plot_export::PlotExportQueue) {
+        self.histogram_plot_sized(ui, key, id, 180.0, export);
 
         let hist = self.histogram_data.get(key);
         let counts: i64 = hist.map(|h| h.iter().map(|&c| c as i64).sum()).unwrap_or(0);

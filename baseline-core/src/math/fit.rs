@@ -1,12 +1,5 @@
 //! Direct transcription of `Infrastructure/Services/MathService.cs`.
-//!
 //! `GaussianFit`/`LorentzianFit` used MathNet.Numerics' `LevenbergMarquardtMinimizer`
-//! in the C# source (the only external-library optimizer in the codebase); here
-//! they're served by a small hand-rolled Levenberg-Marquardt solver (reusing the
-//! same normal-equations/Gaussian-elimination approach as the HEMG optimizer)
-//! since no equivalent crate was pulled in. The HEMG path itself
-//! (`hemg_double_sided_fit` and friends) delegates to `super::hemg`, which *is*
-//! a verbatim port of the hand-rolled C# optimizer.
 
 use super::hemg;
 use crate::models::baseline::{FittingResult, HemgFitConfig};

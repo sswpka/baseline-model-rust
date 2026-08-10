@@ -151,14 +151,13 @@ impl Default for BaselineMode {
 }
 
 fn dirs_next_documents() -> PathBuf {
-    // .NET's Environment.SpecialFolder.MyDocuments equivalent.
     std::env::var_os("USERPROFILE")
         .map(|p| PathBuf::from(p).join("Documents"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
 impl BaselineMode {
-    pub fn update(&mut self, ctx: &egui::Context) {
+    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
         self.drain_worker_messages();
 
         egui::TopBottomPanel::top("baseline_top").show(ctx, |ui| {
@@ -181,8 +180,8 @@ impl BaselineMode {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let (x_channels, z_channels) = self.channels.split_at_mut(8);
                 ui.columns(2, |columns| {
-                    channel_block_ui(&mut columns[0], "X-direction (CH 1-8)", x_channels);
-                    channel_block_ui(&mut columns[1], "Z-direction (CH 9-16)", z_channels);
+                    channel_block_ui(&mut columns[0], "X-direction (CH 1-8)", x_channels, export);
+                    channel_block_ui(&mut columns[1], "Z-direction (CH 9-16)", z_channels, export);
                 });
             });
         });

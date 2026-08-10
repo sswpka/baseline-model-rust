@@ -100,7 +100,7 @@ impl Default for FluxMode {
 }
 
 impl FluxMode {
-    pub fn update(&mut self, ctx: &egui::Context) {
+    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
         self.drain_messages();
 
         egui::TopBottomPanel::top("flux_top").show(ctx, |ui| {
@@ -168,8 +168,9 @@ impl FluxMode {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for layer in &self.layers {
                     ui.label(format!("{} - {}", layer.name, layer.stats_text));
-                    let plot = Plot::new(format!("flux_plot_{}", layer.name)).height(180.0).legend(Legend::default());
-                    plot.show(ui, |plot_ui| {
+                    let id_source = format!("flux_plot_{}", layer.name);
+                    let plot = Plot::new(id_source.clone()).height(180.0).legend(Legend::default());
+                    crate::plot_export::show(ui, export, &id_source, &layer.name, plot, |plot_ui| {
                         if !layer.x_data.is_empty() {
                             let points: PlotPoints = layer
                                 .x_data

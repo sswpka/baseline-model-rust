@@ -2,6 +2,7 @@
 //! mode with lock checkboxes and `OptimizeManual` are deferred - see project
 //! notes; this covers the auto-fit display pipeline that `ProcessData` drives).
 
+use crate::plot_export::{self, PlotExportQueue};
 use egui::Color32;
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints};
 
@@ -32,7 +33,7 @@ pub struct ChannelState {
 }
 
 impl ChannelState {
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, export: &mut PlotExportQueue) {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.strong(&self.title);
@@ -43,12 +44,10 @@ impl ChannelState {
             });
             ui.label(&self.stats_text);
 
-            let plot = Plot::new(format!("channel_plot_{}", self.channel_index))
-                .height(220.0)
-                .allow_scroll(true)
-                .legend(egui_plot::Legend::default());
+            let id_source = format!("channel_plot_{}", self.channel_index);
+            let plot = Plot::new(id_source.clone()).height(220.0).allow_scroll(true).legend(egui_plot::Legend::default());
 
-            plot.show(ui, |plot_ui| {
+            plot_export::show(ui, export, &id_source, &self.title, plot, |plot_ui| {
                 if !self.counts.is_empty() && self.bin_centers.len() == self.counts.len() {
                     // Data renders as a bar histogram (matching the original's
                     // `AddBar`), except in log scale where bars of near-zero
@@ -116,13 +115,13 @@ impl ChannelState {
 /// block gets the same area regardless of how much text/stats the
 /// neighboring channel happens to have. Shared by Baseline and Calibration
 /// mode, which both split their 16 channels into two 8-channel blocks.
-pub fn channel_block_ui(ui: &mut egui::Ui, heading: &str, channels: &mut [ChannelState]) {
+pub fn channel_block_ui(ui: &mut egui::Ui, heading: &str, channels: &mut [ChannelState], export: &mut PlotExportQueue) {
     ui.vertical(|ui| {
         ui.heading(heading);
         ui.separator();
         ui.columns(2, |cols| {
             for (i, ch) in channels.iter_mut().enumerate() {
-                ch.ui(&mut cols[i % 2]);
+                ch.ui(&mut cols[i % 2], export);
             }
         });
     });

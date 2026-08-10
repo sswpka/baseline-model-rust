@@ -4,6 +4,7 @@ mod calibration_mode;
 mod channel;
 mod flux_mode;
 mod observation_mode;
+mod plot_export;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

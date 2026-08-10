@@ -79,7 +79,7 @@ impl Default for CalibrationMode {
 }
 
 impl CalibrationMode {
-    pub fn update(&mut self, ctx: &egui::Context) {
+    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
         self.drain_messages();
 
         egui::TopBottomPanel::top("calibration_top").show(ctx, |ui| {
@@ -171,8 +171,8 @@ impl CalibrationMode {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let (x_channels, z_channels) = self.channels.split_at_mut(8);
                 ui.columns(2, |columns| {
-                    channel_block_ui(&mut columns[0], "X-direction (X1-X8)", x_channels);
-                    channel_block_ui(&mut columns[1], "Z-direction (Z1-Z8)", z_channels);
+                    channel_block_ui(&mut columns[0], "X-direction (X1-X8)", x_channels, export);
+                    channel_block_ui(&mut columns[1], "Z-direction (Z1-Z8)", z_channels, export);
                 });
             });
         });

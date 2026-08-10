@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["baseline-core", "baseline-app"]
+
+[workspace.package]
+version = "2.3.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = true

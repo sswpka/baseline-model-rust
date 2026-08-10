@@ -1,0 +1,16 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build (baseline-app debug)",
+            "type": "cargo",
+            "command": "build",
+            "args": ["-p", "baseline-app"],
+            "problemMatcher": ["$rustc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}

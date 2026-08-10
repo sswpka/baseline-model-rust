@@ -1,0 +1,13 @@
+[package]
+name = "baseline-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+baseline-core = { path = "../baseline-core" }
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+rfd = "0.15"
+chrono = "0.4"
+rayon = "1"

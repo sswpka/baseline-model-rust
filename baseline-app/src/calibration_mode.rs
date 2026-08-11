@@ -4,12 +4,14 @@
 
 use baseline_core::calibration::CalibrationAccumulator;
 use baseline_core::io;
+use baseline_core::math::MathService;
 use baseline_core::observation::data_processor::{split_hex_data, validate_header};
 use egui::Color32;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::channel::{channel_block_ui, ChannelState};
+use crate::fit_overlay::{self, FitOverlayFlags};
 
 enum WorkerMsg {
     Status(String, Color32),
@@ -37,6 +39,12 @@ pub struct CalibrationMode {
     is_busy: bool,
     progress_value: f64,
     header_check_status: String,
+
+    show_gaussian_fit: bool,
+    show_hemg_single_fit: bool,
+    show_hemg_double_fit: bool,
+    show_lorentzian_fit: bool,
+    math: MathService,
 
     accumulator: CalibrationAccumulator,
     channels: Vec<ChannelState>,
@@ -70,6 +78,11 @@ impl Default for CalibrationMode {
             is_busy: false,
             progress_value: 0.0,
             header_check_status: String::new(),
+            show_gaussian_fit: true,
+            show_hemg_single_fit: false,
+            show_hemg_double_fit: false,
+            show_lorentzian_fit: false,
+            math: MathService::new(),
             accumulator: CalibrationAccumulator::default(),
             channels,
             tx,
@@ -118,7 +131,7 @@ impl CalibrationMode {
                 .show_ui(ui, |ui| {
                     for (i, name) in ["L1", "L2", "L6", "L7"].iter().enumerate() {
                         if ui.selectable_value(&mut self.selected_layer_index, i, *name).changed() {
-                            self.update_plots();
+                            self.update_plots(true);
                         }
                     }
                 });
@@ -138,16 +151,30 @@ impl CalibrationMode {
                     self.x_axis_min = 0.0;
                     self.x_axis_max = 16384.0;
                 }
-                self.update_plots();
+                self.update_plots(true);
             }
             ui.horizontal(|ui| {
+                // Fit-solving (up to 16 channels x 4 fits) is deferred until
+                // the drag settles (`drag_stopped`) or a typed value is
+                // committed (`lost_focus`), not re-run on every frame of the
+                // drag - see `update_plots`'s doc comment. The histogram
+                // itself still updates live via `changed()` so the bars
+                // track the drag.
                 ui.label("X Min");
-                if ui.add(egui::DragValue::new(&mut self.x_axis_min)).changed() {
-                    self.update_plots();
+                let min_resp = ui.add(egui::DragValue::new(&mut self.x_axis_min));
+                if min_resp.changed() {
+                    self.update_plots(false);
+                }
+                if min_resp.drag_stopped() || min_resp.lost_focus() {
+                    self.update_plots(true);
                 }
                 ui.label("X Max");
-                if ui.add(egui::DragValue::new(&mut self.x_axis_max)).changed() {
-                    self.update_plots();
+                let max_resp = ui.add(egui::DragValue::new(&mut self.x_axis_max));
+                if max_resp.changed() {
+                    self.update_plots(false);
+                }
+                if max_resp.drag_stopped() || max_resp.lost_focus() {
+                    self.update_plots(true);
                 }
             });
             ui.horizontal(|ui| {
@@ -155,6 +182,18 @@ impl CalibrationMode {
                 ui.add(egui::DragValue::new(&mut self.delay_time));
                 ui.label("Threshold");
                 ui.add(egui::DragValue::new(&mut self.threshold));
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Fits:");
+                let mut fits_changed = false;
+                fits_changed |= ui.checkbox(&mut self.show_gaussian_fit, "Gaussian").changed();
+                fits_changed |= ui.checkbox(&mut self.show_hemg_single_fit, "HEMG single").changed();
+                fits_changed |= ui.checkbox(&mut self.show_hemg_double_fit, "HEMG double").changed();
+                fits_changed |= ui.checkbox(&mut self.show_lorentzian_fit, "Lorentzian").changed();
+                if fits_changed {
+                    self.update_plots(true);
+                }
             });
 
             ui.separator();
@@ -191,7 +230,7 @@ impl CalibrationMode {
                 WorkerMsg::Progress(p) => self.progress_value = p,
                 WorkerMsg::DataLoaded(acc) => {
                     self.accumulator = acc;
-                    self.update_plots();
+                    self.update_plots(true);
                 }
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
@@ -210,6 +249,11 @@ impl CalibrationMode {
             ch.counts.clear();
             ch.bin_centers.clear();
             ch.stats_text.clear();
+            ch.active_fits.clear();
+            ch.mu = 0.0;
+            ch.sigma = 0.0;
+            ch.fwhm = 0.0;
+            ch.resolution = 0.0;
         }
         self.status_message = "Reset complete.".to_string();
         self.progress_value = 0.0;
@@ -275,23 +319,60 @@ impl CalibrationMode {
         std::thread::spawn(move || read_data_worker(files_to_read, tx));
     }
 
-    fn update_plots(&mut self) {
+    /// Rebuilds histograms for the selected layer/axis and, unless
+    /// `recompute_fits` is `false`, re-solves the enabled fit overlays too.
+    /// Fit solving (up to 16 channels x 4 fits, with "HEMG single" costing
+    /// two solves each - see `fit_overlay::compute_fits`) is real work on
+    /// the UI thread; `recompute_fits: false` lets a caller keep the bars
+    /// responsive (e.g. while an X Min/Max `DragValue` is actively being
+    /// dragged) without re-solving on every frame of the drag.
+    fn update_plots(&mut self, recompute_fits: bool) {
         let source = if self.selected_x_axis_index == 1 {
             self.accumulator.voltage_columns(self.selected_layer_index)
         } else {
             self.accumulator.columns(self.selected_layer_index)
         };
 
+        let flags = FitOverlayFlags {
+            gaussian: self.show_gaussian_fit,
+            lorentzian: self.show_lorentzian_fit,
+            hemg_single: self.show_hemg_single_fit,
+            hemg_double: self.show_hemg_double_fit,
+        };
+
         for ch in 0..16 {
             let data_for_channel: Vec<f64> = source[ch].iter().copied().filter(|&d| d > 0.0).collect();
             if data_for_channel.is_empty() {
+                self.channels[ch].active_fits.clear();
                 continue;
             }
             let (counts, bin_centers) =
                 baseline_core::baseline_processing::build_histogram_avg_centers(&data_for_channel, self.x_axis_min, self.x_axis_max, 500);
+
+            if recompute_fits {
+                let (stats, fits) = fit_overlay::compute_fits(&self.math, &bin_centers, &counts, &flags);
+                self.channels[ch].mu = stats.mu;
+                self.channels[ch].sigma = stats.sigma;
+                self.channels[ch].fwhm = stats.fwhm;
+                self.channels[ch].resolution = stats.resolution;
+                self.channels[ch].active_fits = fits;
+                self.channels[ch].stats_text = format!(
+                    "Counts: {}  mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%",
+                    data_for_channel.len(),
+                    stats.mu,
+                    stats.sigma,
+                    stats.fwhm,
+                    stats.resolution
+                );
+            } else {
+                // Bin centers are about to change under it; drop the stale
+                // curve rather than draw it mismatched against the new bars
+                // until the drag settles and fits are recomputed.
+                self.channels[ch].active_fits.clear();
+                self.channels[ch].stats_text = format!("Counts: {}", data_for_channel.len());
+            }
             self.channels[ch].counts = counts;
             self.channels[ch].bin_centers = bin_centers;
-            self.channels[ch].stats_text = format!("Counts: {}", data_for_channel.len());
         }
     }
 }

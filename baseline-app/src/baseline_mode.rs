@@ -22,7 +22,8 @@ use egui::Color32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::channel::{channel_block_ui, ChannelState, FitCurve};
+use crate::channel::{channel_block_ui, ChannelState};
+use crate::fit_overlay::{self, FitOverlayFlags};
 
 pub enum WorkerMsg {
     Status(String, Color32),
@@ -610,35 +611,17 @@ fn recompute_fits_worker(snapshots: Vec<ChannelSnapshot>, flags: FitFlags, tx: S
                 return (snap.channel_index, state);
             }
 
-            let mut fits = Vec::new();
-            if flags.gaussian {
-                let res = math.gaussian_fit(&snap.bin_centers, &snap.counts);
-                if res.is_valid && !res.fit_curve.is_empty() {
-                    state.mu = res.mu;
-                    state.sigma = res.sigma;
-                    state.fwhm = res.fwhm;
-                    state.resolution = res.resolution;
-                    fits.push(FitCurve { curve: res.fit_curve, color: Color32::from_rgb(50, 220, 50), label: "Gaussian".to_string() });
-                }
-            }
-            if flags.hemg_single {
-                let res = math.hemg_double_sided_fit(&snap.bin_centers, &snap.counts, None, None);
-                if res.is_valid && !res.fit_curve.is_empty() {
-                    fits.push(FitCurve { curve: res.fit_curve, color: Color32::RED, label: "HEMG single".to_string() });
-                }
-            }
-            if flags.hemg_double {
-                let res = math.hemg_double_sided_fit(&snap.bin_centers, &snap.counts, None, None);
-                if res.is_valid && !res.fit_curve.is_empty() {
-                    fits.push(FitCurve { curve: res.fit_curve, color: Color32::from_rgb(220, 50, 220), label: "HEMG double".to_string() });
-                }
-            }
-            if flags.lorentzian {
-                let res = math.lorentzian_fit(&snap.bin_centers, &snap.counts);
-                if res.is_valid && !res.fit_curve.is_empty() {
-                    fits.push(FitCurve { curve: res.fit_curve, color: Color32::from_rgb(0, 220, 220), label: "Lorentzian".to_string() });
-                }
-            }
+            let overlay_flags = FitOverlayFlags {
+                gaussian: flags.gaussian,
+                lorentzian: flags.lorentzian,
+                hemg_single: flags.hemg_single,
+                hemg_double: flags.hemg_double,
+            };
+            let (stats, fits) = fit_overlay::compute_fits(&math, &snap.bin_centers, &snap.counts, &overlay_flags);
+            state.mu = stats.mu;
+            state.sigma = stats.sigma;
+            state.fwhm = stats.fwhm;
+            state.resolution = stats.resolution;
 
             state.stats_text = format!("mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%", state.mu, state.sigma, state.fwhm, state.resolution);
             state.bin_centers = snap.bin_centers;
@@ -856,34 +839,18 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
 
             let mut fits = Vec::new();
             if filtered.len() > 5 {
-                if config.show_gaussian_fit {
-                    let res = math.gaussian_fit(&bin_centers, &counts);
-                    if res.is_valid && !res.fit_curve.is_empty() {
-                        state.mu = res.mu;
-                        state.sigma = res.sigma;
-                        state.fwhm = res.fwhm;
-                        state.resolution = res.resolution;
-                        fits.push(FitCurve { curve: res.fit_curve, color: Color32::from_rgb(50, 220, 50), label: "Gaussian".to_string() });
-                    }
-                }
-                if config.show_hemg_single_fit {
-                    let res = math.hemg_double_sided_fit(&bin_centers, &counts, Some(&filtered), None);
-                    if res.is_valid && !res.fit_curve.is_empty() {
-                        fits.push(FitCurve { curve: res.fit_curve, color: Color32::RED, label: "HEMG single".to_string() });
-                    }
-                }
-                if config.show_hemg_double_fit {
-                    let res = math.hemg_double_sided_fit(&bin_centers, &counts, Some(&filtered), None);
-                    if res.is_valid && !res.fit_curve.is_empty() {
-                        fits.push(FitCurve { curve: res.fit_curve, color: Color32::from_rgb(220, 50, 220), label: "HEMG double".to_string() });
-                    }
-                }
-                if config.show_lorentzian_fit {
-                    let res = math.lorentzian_fit(&bin_centers, &counts);
-                    if res.is_valid && !res.fit_curve.is_empty() {
-                        fits.push(FitCurve { curve: res.fit_curve, color: Color32::from_rgb(0, 220, 220), label: "Lorentzian".to_string() });
-                    }
-                }
+                let overlay_flags = FitOverlayFlags {
+                    gaussian: config.show_gaussian_fit,
+                    lorentzian: config.show_lorentzian_fit,
+                    hemg_single: config.show_hemg_single_fit,
+                    hemg_double: config.show_hemg_double_fit,
+                };
+                let (stats, computed) = fit_overlay::compute_fits(&math, &bin_centers, &counts, &overlay_flags);
+                state.mu = stats.mu;
+                state.sigma = stats.sigma;
+                state.fwhm = stats.fwhm;
+                state.resolution = stats.resolution;
+                fits = computed;
             }
 
             state.stats_text = format!("mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%", state.mu, state.sigma, state.fwhm, state.resolution);

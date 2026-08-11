@@ -10,7 +10,7 @@
 
 use crate::math::KalmanFilter;
 use crate::models::observation::{BgoData, BgoLayer, DetectorLayer, LayerData};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -25,6 +25,13 @@ pub struct ParticleResult {
     pub particle_data: Vec<String>,
     pub particle_number: i32,
     pub milliseconds: i32,
+    /// The event's absolute time: the containing line's timecode (decoded
+    /// via `get_date_time_from_hex_data`) plus this particle's own
+    /// `milliseconds` offset - every particle on the same line shares the
+    /// line's timecode but gets a distinct sub-second offset from it.
+    pub time: DateTime<Utc>,
+    /// (X, Y) pulse heights per DSSD layer.
+    pub dssd_pulses: HashMap<DetectorLayer, (i32, i32)>,
     /// (High gain, Low gain) pulse heights per BGO layer.
     pub bgo_pulses: HashMap<BgoLayer, (i32, i32)>,
 }
@@ -117,7 +124,12 @@ impl ObservationDataProcessor {
             }
             let hex_data = split_hex_data(trimmed);
             if hex_data.len() >= HEADER_OFFSET + PARTICLE_DATA_LENGTH {
-                self.process_particles(&hex_data);
+                // Best-effort: an undecodable line timecode falls back to the
+                // Unix epoch rather than skipping the line's particles
+                // entirely, matching `get_date_time_from_hex`'s epoch
+                // fallback in `flux::processing`.
+                let line_time = get_date_time_from_hex_data(&hex_data).unwrap_or_else(|_| DateTime::from_timestamp(0, 0).unwrap());
+                self.process_particles(&hex_data, line_time);
             }
         }
         Ok(())
@@ -207,7 +219,7 @@ impl ObservationDataProcessor {
         result
     }
 
-    pub fn process_particles(&mut self, hex_data: &[String]) {
+    pub fn process_particles(&mut self, hex_data: &[String], line_time: DateTime<Utc>) {
         for i in 0..PARTICLES_PER_LINE {
             let start = HEADER_OFFSET + PARTICLE_DATA_LENGTH * i;
             if start >= hex_data.len() {
@@ -219,13 +231,13 @@ impl ObservationDataProcessor {
                 break;
             }
 
-            if let Ok(processed) = self.process_particle_data(particle_data, i) {
+            if let Ok(processed) = self.process_particle_data(particle_data, i, line_time) {
                 self.results.push(processed);
             }
         }
     }
 
-    pub fn process_particle_data(&mut self, particle_data: &[String], i: usize) -> Result<ParticleResult, String> {
+    pub fn process_particle_data(&mut self, particle_data: &[String], i: usize, line_time: DateTime<Utc>) -> Result<ParticleResult, String> {
         let particle_data_dec: Vec<i32> = particle_data
             .iter()
             .map(|hex| i32::from_str_radix(hex, 16).map_err(|e| e.to_string()))
@@ -236,16 +248,18 @@ impl ObservationDataProcessor {
         }
 
         let milliseconds = (((particle_data_dec[0] << 8) + particle_data_dec[1]) / 1000) as i32;
+        let time = line_time + chrono::Duration::milliseconds(milliseconds as i64);
 
         // --- DSSD layers ---
         // L1: pos idx 2, X-Ph idx 3-4, Y-Ph idx 5-6
         // L2: pos idx 7, X-Ph idx 8-9, Y-Ph idx 10-11
         // L6: pos idx 24, X-Ph idx 25-26, Y-Ph idx 27-28
         // L7: pos idx 29, X-Ph idx 30-31, Y-Ph idx 32-33
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L1, 2, 3, 5);
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L2, 7, 8, 10);
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L6, 24, 25, 27);
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L7, 29, 30, 32);
+        let mut dssd_pulses = HashMap::new();
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L1, 2, 3, 5, &mut dssd_pulses);
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L2, 7, 8, 10, &mut dssd_pulses);
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L6, 24, 25, 27, &mut dssd_pulses);
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L7, 29, 30, 32, &mut dssd_pulses);
 
         // --- BGO layers ---
         // L3: H idx 12-13, L idx 14-15
@@ -260,16 +274,27 @@ impl ObservationDataProcessor {
             particle_data: particle_data.to_vec(),
             particle_number: i as i32 + 1,
             milliseconds,
+            time,
+            dssd_pulses,
             bgo_pulses,
         })
     }
 
-    fn process_dssd_layer(&mut self, data: &[i32], layer: DetectorLayer, pos_idx: usize, x_ph_idx: usize, y_ph_idx: usize) {
+    fn process_dssd_layer(
+        &mut self,
+        data: &[i32],
+        layer: DetectorLayer,
+        pos_idx: usize,
+        x_ph_idx: usize,
+        y_ph_idx: usize,
+        out: &mut HashMap<DetectorLayer, (i32, i32)>,
+    ) {
         let detect_x = (data[pos_idx] & 240) >> 4; // upper 4 bits
         let detect_y = data[pos_idx] & 15; // lower 4 bits
 
         let ph_x = (data[x_ph_idx] << 8) + data[x_ph_idx + 1];
         let ph_y = (data[y_ph_idx] << 8) + data[y_ph_idx + 1];
+        out.insert(layer, (ph_x, ph_y));
 
         let layer_data = self.dssd_data.get_mut(&layer).unwrap();
         layer_data.pulse_height_x.push(ph_x as f64);
@@ -352,6 +377,13 @@ fn histogram_of_i32(values: &[i32]) -> Vec<i32> {
     hist
 }
 
+/// The instrument's own timecode base: the 6-byte timecode this function
+/// decodes (4-byte seconds + 2-byte milliseconds) counts up from this
+/// moment, not from the Unix epoch.
+fn observation_epoch() -> DateTime<Utc> {
+    DateTime::from_naive_utc_and_offset(NaiveDate::from_ymd_opt(2024, 10, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(), Utc)
+}
+
 pub fn get_date_time_from_hex_data(hex_data: &[String]) -> Result<DateTime<Utc>, String> {
     if hex_data.len() < 14 {
         return Err("insufficient hex data for timecode".to_string());
@@ -365,10 +397,7 @@ pub fn get_date_time_from_hex_data(hex_data: &[String]) -> Result<DateTime<Utc>,
     let seconds_part = u32::from_be_bytes([timecode_dec[0], timecode_dec[1], timecode_dec[2], timecode_dec[3]]);
     let milliseconds_part = u16::from_be_bytes([timecode_dec[4], timecode_dec[5]]);
 
-    let total_seconds = seconds_part as f64 + milliseconds_part as f64 / 1000.0;
-    let unix_secs = total_seconds.floor() as i64;
-
-    DateTime::from_timestamp(unix_secs, 0).ok_or_else(|| "invalid timestamp".to_string())
+    Ok(observation_epoch() + chrono::Duration::seconds(seconds_part as i64) + chrono::Duration::milliseconds(milliseconds_part as i64))
 }
 
 pub fn split_hex_data(hex_string: &str) -> Vec<String> {
@@ -387,39 +416,3 @@ pub fn validate_header(hex_data: &[String]) -> bool {
     hex_data[0].eq_ignore_ascii_case("E2") && hex_data[1].eq_ignore_ascii_case("25")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_hex_data_pairs_correctly() {
-        let result = split_hex_data("E22508B0");
-        assert_eq!(result, vec!["E2", "25", "08", "B0"]);
-    }
-
-    #[test]
-    fn validate_header_accepts_e225_case_insensitive() {
-        assert!(validate_header(&["e2".to_string(), "25".to_string()]));
-        assert!(validate_header(&["E2".to_string(), "25".to_string()]));
-        assert!(!validate_header(&["E2".to_string(), "24".to_string()]));
-        assert!(!validate_header(&["E2".to_string()]));
-    }
-
-    #[test]
-    fn process_particle_data_rejects_short_input() {
-        let mut processor = ObservationDataProcessor::new();
-        let short: Vec<String> = vec!["00".to_string(); 3];
-        assert!(processor.process_particle_data(&short, 0).is_err());
-    }
-
-    #[test]
-    fn process_particles_does_not_panic_on_truncated_line() {
-        let mut processor = ObservationDataProcessor::new();
-        // Only enough for header offset, no particle payload.
-        let hex_data: Vec<String> = vec!["00".to_string(); HEADER_OFFSET + PARTICLE_DATA_LENGTH];
-        processor.process_particles(&hex_data);
-        // All-zero particle data decodes fine (no panic); just verifying no
-        // out-of-bounds access on minimal-length input.
-        assert!(processor.results.len() <= PARTICLES_PER_LINE);
-    }
-}

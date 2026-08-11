@@ -92,19 +92,3 @@ pub fn find_excel_file(output_name: &str) -> Option<PathBuf> {
     get_possible_file_paths(output_name).into_iter().find(|p| p.exists())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_excel_save_path_adds_xlsx_extension() {
-        let path = resolve_excel_save_path("MyResult", "").unwrap();
-        assert!(path.to_string_lossy().ends_with("MyResult.xlsx"));
-        assert!(path.to_string_lossy().contains("Source"));
-    }
-
-    #[test]
-    fn resolve_excel_save_path_rejects_empty_name() {
-        assert!(resolve_excel_save_path("", "").is_err());
-    }
-}

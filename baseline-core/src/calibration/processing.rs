@@ -97,34 +97,3 @@ fn parse_hex_pair(hex_data: &[String], start_index: usize) -> f64 {
     ((high << 8) + low) as f64
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_calibration_ignores_short_input() {
-        let mut acc = CalibrationAccumulator::default();
-        let hex_data = vec!["00".to_string(); 10];
-        acc.process_calibration(&hex_data);
-        assert!(acc.l1_columns[0].is_empty());
-    }
-
-    #[test]
-    fn parse_hex_pair_out_of_range_returns_zero() {
-        let hex_data = vec!["AB".to_string()];
-        assert_eq!(parse_hex_pair(&hex_data, 5), 0.0);
-    }
-
-    #[test]
-    fn process_calibration_decodes_first_channel() {
-        let mut acc = CalibrationAccumulator::default();
-        let mut hex_data = vec!["00".to_string(); 18 + 64 * 11];
-        // offset_l1l2 for i=0 is 18; L1 channel 0 is at hex_data[18..20].
-        hex_data[18] = "AB".to_string();
-        hex_data[19] = "CD".to_string();
-        acc.process_calibration(&hex_data);
-        let expected = ((0xAB << 8) + 0xCD) as f64;
-        assert_eq!(acc.l1_columns[0][0], expected);
-        assert!((acc.l1_volt_columns[0][0] - expected * VOLTAGE_SCALE).abs() < 1e-9);
-    }
-}

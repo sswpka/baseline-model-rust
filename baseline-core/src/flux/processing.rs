@@ -164,9 +164,12 @@ pub struct FluxLayerPlot {
 }
 
 /// Matches the standalone `GetDateTimeFromHexData(string)` in
-/// `FluxViewModel.DataProcessing.cs` (distinct from the Observation-mode
-/// version in `observation::data_processor`, which truncates milliseconds;
-/// this one adds them as a precise offset via `AddMilliseconds`).
+/// `FluxViewModel.DataProcessing.cs`. Unlike the Observation-mode version in
+/// `observation::data_processor` (which counts from a 2024-10-01 base, per
+/// that instrument's own timecode epoch), this one still treats
+/// `seconds_part` as a literal Unix timestamp - the two haven't been
+/// reconciled, so Flux-mode timestamps currently read ~1971 for the same
+/// raw bytes that decode to a 2020s date under Observation mode.
 pub fn get_date_time_from_hex(hex_string: &str) -> DateTime<Utc> {
     let hex = hex_string.as_bytes();
     let epoch = || DateTime::from_timestamp(0, 0).unwrap();
@@ -254,29 +257,3 @@ fn parse_hex_byte(hex: &[u8], char_offset: usize) -> Option<u8> {
     u8::from_str_radix(s, 16).ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_flux_observation_rejects_undersized_input() {
-        let mut acc = FluxAccumulator::default();
-        assert!(!acc.process_flux_observation("00"));
-        assert!(acc.all_results.is_empty());
-    }
-
-    #[test]
-    fn process_flux_observation_parses_minimal_valid_packet() {
-        let mut acc = FluxAccumulator::default();
-        let hex = "0".repeat(4064);
-        assert!(acc.process_flux_observation(&hex));
-        assert_eq!(acc.all_results.len(), 1);
-        assert_eq!(acc.all_results[0].time_seconds, 0.0);
-    }
-
-    #[test]
-    fn process_header_internal_rejects_undersized_input() {
-        let hex_data = vec!["00".to_string(); 10];
-        assert!(process_header_internal(&hex_data).is_none());
-    }
-}

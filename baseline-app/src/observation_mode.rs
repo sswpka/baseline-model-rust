@@ -2,7 +2,7 @@
 //! `.FileOperations.cs`). Deferred (see project notes): the
 //! `ObservationDetailWindow` (per-histogram peak-locking), and the BGO
 //! adaptive/Kalman/Z-score filters - this
-//! covers file ingestion, Excel export, and the DSSD pulse-height/strip and
+//! covers file ingestion and the DSSD pulse-height/strip and
 //! BGO gain histograms that `AnalyzeFiles`/`ObservationDataProcessor`
 //! actually compute, switchable via the DSSD/X-Strip/Y-Strip/BGO view-mode
 //! selector (mirrors the original's DSSD/BGO tabs and their inner
@@ -15,21 +15,109 @@ use baseline_core::io;
 use baseline_core::math::MathService;
 use baseline_core::models::observation::{BgoLayer, DetectorLayer};
 use baseline_core::observation::ObservationDataProcessor;
+use chrono::{DateTime, Utc};
 use egui::Color32;
 use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
+/// DSSD/BGO layers in the Data Table tab's fixed column order (see
+/// `ObservationMode::data_table_ui`/`export_table_csv`) - matches the order
+/// `ObservationDataProcessor::get_histogram_data` iterates them in.
+const DSSD_TABLE_LAYERS: [DetectorLayer; 4] = [DetectorLayer::L1, DetectorLayer::L2, DetectorLayer::L6, DetectorLayer::L7];
+const BGO_TABLE_LAYERS: [BgoLayer; 3] = [BgoLayer::L3, BgoLayer::L4, BgoLayer::L5];
+
+/// One decoded particle event for the Data Table tab: every series (each
+/// DSSD layer's (X, Y) pulse height, each BGO layer's (High, Low) gain) at
+/// the timestamp they all share, since they're decoded from the same
+/// particle payload (see `ParticleResult::time`). `dssd`/`bgo` are
+/// positional against `DSSD_TABLE_LAYERS`/`BGO_TABLE_LAYERS` (converted once
+/// from `ParticleResult`'s `HashMap`s in `analyze_files_worker`) rather than
+/// keyed, since the Data Table tab re-reads every event every frame and a
+/// large file can decode well over 100k of them.
+#[derive(Debug, Clone)]
+struct EventRow {
+    time: DateTime<Utc>,
+    dssd: [(i32, i32); 4],
+    bgo: [(i32, i32); 3],
+}
+
+/// "YYYY-MM-DD HH:MM:SS.mmm", matching the timecode format this project
+/// decodes DSSD/BGO event timestamps to elsewhere.
+fn format_event_time(time: DateTime<Utc>) -> String {
+    time.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
 /// A fit curve computed over a cropped window of a histogram (see
 /// `compute_fits`): `curve[i]` corresponds to channel `start + i`, not
 /// channel `i` - unlike `channel::FitCurve`, which is always index-aligned
-/// 1:1 with its full `bin_centers`.
+/// 1:1 with its full `bin_centers`. Also carries the fit's scalar
+/// parameters (`FittingResult`'s `peak`/`mu`/`sigma`/`fwhm`/`resolution`) so
+/// `format_histogram_stats` can report them without re-fitting.
 struct ObsFitCurve {
     start: usize,
     curve: Vec<f64>,
     color: Color32,
     label: String,
+    peak: f64,
+    mu: f64,
+    sigma: f64,
+    fwhm: f64,
+    resolution: f64,
+}
+
+const EMPTY_HISTOGRAM_STATS: &str = "Peak: -   Counts: 0   Mean: -   RMS: -   FWHM: -   Res: -";
+
+/// Descriptive stats line for one histogram (Peak/Counts/Mean/RMS/FWHM/Res),
+/// matching the original's `PlotHistogram`/`PlotStripHistogram`/
+/// `PlotBGOHistogram`:
+/// - When a fit is active, Peak/Mean/RMS/FWHM/Res come from the *fit*
+///   (`FittingResult::peak`/`mu`/`sigma`/`fwhm`/`resolution`), not the raw
+///   data - e.g. the original's `PlotHistogram` sets `peakLabel.Text =
+///   fitResult.Peak`, not the histogram's raw max bin. `fits` is
+///   `compute_fits`'s output for this histogram; when more than one fit
+///   checkbox is enabled at once (this port's independent-checkboxes design,
+///   unlike the original's single fit-method `ComboBox`), the first entry
+///   wins - `compute_fits` always tries Gaussian, then Lorentzian, then HEMG,
+///   in that order.
+/// - When no fit is active/valid, Peak/Mean/RMS fall back to raw histogram
+///   stats (mirroring `PlotStripHistogram`'s non-fit `else` branch: raw max
+///   bin, arithmetic mean, population std of the raw samples) - but FWHM/Res
+///   are left as "-", matching the original, which never computes those two
+///   without a successful fit.
+/// - Counts is independent of fitting (raw positive-sample count), but -
+///   like the fit itself (see `compute_fits`) - restricted to `x_range`
+///   when set, matching the original's `filteredData.Length` (counted
+///   *after* the `v >= xMin && v <= xMax` filter, not before).
+fn format_histogram_stats(math: &MathService, hist: &[i32], fits: Option<&[ObsFitCurve]>, x_range: Option<(f64, f64)>) -> String {
+    let (range_start, range_end) = match x_range {
+        Some((lo, hi)) => ((lo.max(0.0) as usize).min(hist.len()), ((hi.max(0.0) as usize) + 1).min(hist.len())),
+        None => (0, hist.len()),
+    };
+    if range_end <= range_start {
+        return EMPTY_HISTOGRAM_STATS.to_string();
+    }
+    let domain = &hist[range_start..range_end];
+
+    let counts: i64 = domain.iter().map(|&c| c as i64).sum();
+    if counts == 0 {
+        return EMPTY_HISTOGRAM_STATS.to_string();
+    }
+
+    if let Some(primary) = fits.and_then(|f| f.first()) {
+        return format!(
+            "Peak: {:.2}   Counts: {counts}   Mean: {:.2}   RMS: {:.2}   FWHM: {:.2}   Res: {:.2}%",
+            primary.peak, primary.mu, primary.sigma, primary.fwhm, primary.resolution
+        );
+    }
+
+    let x_data: Vec<f64> = (range_start..range_end).map(|i| i as f64).collect();
+    let y_data: Vec<f64> = domain.iter().map(|&c| c as f64).collect();
+    let (mean, _sigma, peak) = math.calculate_moments(&x_data, &y_data);
+    let rms = math.calculate_rms(&x_data, &y_data, mean);
+
+    format!("Peak: {peak:.0}   Counts: {counts}   Mean: {mean:.2}   RMS: {rms:.2}   FWHM: -   Res: -")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,32 +128,41 @@ enum ObservationViewMode {
     Bgo,
 }
 
+/// Which of the two top-level tabs the central panel is showing: the
+/// grid-of-plots view, or a flat, event-by-event table (see `EventRow`) of
+/// every decoded particle's DSSD/BGO series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationTab {
+    GraphView,
+    DataTable,
+}
+
 enum WorkerMsg {
     Status(String, Color32),
     Busy(bool),
     InputFilesInfo(String),
-    OutputFileName(String),
     HistogramData(HashMap<String, Vec<i32>>),
-    LastSavedPath(String),
+    EventData(Vec<EventRow>),
     Error(String),
 }
 
 pub struct ObservationMode {
     input_files: Vec<PathBuf>,
     input_files_info: String,
-    output_file_name: String,
-    output_directory_path: PathBuf,
 
     status_message: String,
     is_busy: bool,
     progress_value: f64,
     data_count_str: String,
-    last_saved_file_path: String,
 
+    active_tab: ObservationTab,
     view_mode: ObservationViewMode,
     selected_layer: DetectorLayer,
     selected_bgo_layer: BgoLayer,
     histogram_data: HashMap<String, Vec<i32>>,
+    /// Data Table tab's event-by-event rows, populated alongside
+    /// `histogram_data` by `analyze_files_worker`.
+    events: Vec<EventRow>,
 
     /// Mirrors the original's `TxtDSSDXMin`/`TxtDSSDXMax` textboxes: raw
     /// text so the field can be edited freely (including transiently
@@ -93,26 +190,25 @@ pub struct ObservationMode {
 impl Default for ObservationMode {
     fn default() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let output_directory_path = std::env::var_os("USERPROFILE")
-            .map(|p| PathBuf::from(p).join("Documents").join("BaselineModeOutputs"))
-            .unwrap_or_else(|| PathBuf::from("."));
 
         Self {
             input_files: Vec::new(),
             input_files_info: "No files selected".to_string(),
-            output_file_name: String::new(),
-            output_directory_path,
             status_message: "Ready".to_string(),
             is_busy: false,
             progress_value: 0.0,
             data_count_str: "-".to_string(),
-            last_saved_file_path: String::new(),
+            active_tab: ObservationTab::GraphView,
             view_mode: ObservationViewMode::DssdPulseHeight,
             selected_layer: DetectorLayer::L1,
             selected_bgo_layer: BgoLayer::L3,
             histogram_data: HashMap::new(),
-            dssd_x_min: String::new(),
-            dssd_x_max: String::new(),
+            events: Vec::new(),
+            // Matches the original's `TxtDSSDXMin`/`TxtDSSDXMax` XAML
+            // defaults ("0"/"4096") - see `dssd_x_range`'s doc comment for
+            // why this default restriction matters, not just for the view.
+            dssd_x_min: "0".to_string(),
+            dssd_x_max: "4096".to_string(),
             show_gaussian_fit: true,
             show_lorentzian_fit: false,
             show_hemg_fit: false,
@@ -137,23 +233,6 @@ impl ObservationMode {
             }
 
             ui.horizontal(|ui| {
-                ui.label("Output name:");
-                ui.text_edit_singleline(&mut self.output_file_name);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Output dir:");
-                ui.monospace(self.output_directory_path.display().to_string());
-                if ui.button("Browse...").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("Select Output Root Folder").pick_folder() {
-                        self.output_directory_path = dir;
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy && !self.input_files.is_empty(), egui::Button::new("Convert to Excel")).clicked() {
-                    self.convert_files_to_excel();
-                }
                 if ui.add_enabled(!self.is_busy && !self.input_files.is_empty(), egui::Button::new("Analyze Files")).clicked() {
                     self.analyze_files();
                 }
@@ -190,12 +269,17 @@ impl ObservationMode {
                         });
 
                     ui.label("X Min:");
-                    ui.add(egui::TextEdit::singleline(&mut self.dssd_x_min).desired_width(60.0));
+                    if ui.add(egui::TextEdit::singleline(&mut self.dssd_x_min).desired_width(60.0)).changed() {
+                        self.fit_cache.clear();
+                    }
                     ui.label("X Max:");
-                    ui.add(egui::TextEdit::singleline(&mut self.dssd_x_max).desired_width(60.0));
+                    if ui.add(egui::TextEdit::singleline(&mut self.dssd_x_max).desired_width(60.0)).changed() {
+                        self.fit_cache.clear();
+                    }
                     if ui.button("Clear Range").clicked() {
                         self.dssd_x_min.clear();
                         self.dssd_x_max.clear();
+                        self.fit_cache.clear();
                     }
                 }
             });
@@ -219,18 +303,26 @@ impl ObservationMode {
                 ui.add(egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage());
             }
             ui.label(format!("Data count: {}", self.data_count_str));
-            if !self.last_saved_file_path.is_empty() {
-                ui.label(format!("Saved: {}", self.last_saved_file_path));
-            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| match self.view_mode {
-                ObservationViewMode::DssdPulseHeight => self.dssd_pulse_height_ui(ui, export),
-                ObservationViewMode::XStrip => self.strip_grid_ui(ui, 'X', export),
-                ObservationViewMode::YStrip => self.strip_grid_ui(ui, 'Y', export),
-                ObservationViewMode::Bgo => self.bgo_ui(ui, export),
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, ObservationTab::GraphView, "Grid Graph Visualize");
+                ui.selectable_value(&mut self.active_tab, ObservationTab::DataTable, "Data Table");
             });
+            ui.separator();
+
+            match self.active_tab {
+                ObservationTab::GraphView => {
+                    egui::ScrollArea::vertical().id_salt("obs_graph_scroll").show(ui, |ui| match self.view_mode {
+                        ObservationViewMode::DssdPulseHeight => self.dssd_pulse_height_ui(ui, export),
+                        ObservationViewMode::XStrip => self.strip_grid_ui(ui, 'X', export),
+                        ObservationViewMode::YStrip => self.strip_grid_ui(ui, 'Y', export),
+                        ObservationViewMode::Bgo => self.bgo_ui(ui, export),
+                    });
+                }
+                ObservationTab::DataTable => self.data_table_ui(ui),
+            }
         });
 
         if self.is_busy {
@@ -238,10 +330,28 @@ impl ObservationMode {
         }
     }
 
-    /// Parses `dssd_x_min`/`dssd_x_max` into an active view range, mirroring
-    /// the original's `TxtDSSDXMin`/`TxtDSSDXMax`-driven zoom in
-    /// `PlotHistogram`/`PlotStripHistogram`. Returns `None` (full range,
-    /// today's behavior) unless both fields hold a valid `min < max` pair.
+    /// Parses `dssd_x_min`/`dssd_x_max` into an active range, mirroring the
+    /// original's `TxtDSSDXMin`/`TxtDSSDXMax` (defaulted to "0"/"4096" - see
+    /// `ObservationMode::default`). Returns `None` (full 16384-channel
+    /// range) unless both fields hold a valid `min < max` pair - "Clear
+    /// Range" empties both fields to get there deliberately.
+    ///
+    /// Unlike a plain view-zoom, this range is *not* just cosmetic: the
+    /// original rebuilds each DSSD/strip histogram from a raw-sample filter
+    /// (`data.Where(v => v >= xMin && v <= xMax)`) - i.e. out-of-range raw
+    /// samples are excluded from the data entirely, not just scrolled out
+    /// of view. This port
+    /// keeps one precomputed full-range histogram instead of rebuilding per
+    /// range change, so `compute_fits`/`format_histogram_stats` reproduce
+    /// the same effect by restricting which *indices* of that histogram
+    /// they consider, rather than by filtering raw samples. This matters
+    /// most for the sparser per-strip histograms (each strip only collects
+    /// the fraction of particles routed to it, unlike the main X/Y
+    /// histograms which aggregate every particle): with few counts per bin,
+    /// a single out-of-range outlier (e.g. an ADC rail near channel 16383)
+    /// can otherwise out-count the real peak and hijack peak detection -
+    /// which the original's default range prevents by excluding it before
+    /// the peak search ever sees it.
     fn dssd_x_range(&self) -> Option<(f64, f64)> {
         let min = self.dssd_x_min.trim().parse::<f64>().ok()?;
         let max = self.dssd_x_max.trim().parse::<f64>().ok()?;
@@ -256,7 +366,9 @@ impl ObservationMode {
 
         ui.label(format!("{layer_name} - Pulse Height X"));
         self.histogram_plot(ui, &x_key, "obs_x_plot", x_range, export);
+        ui.add_space(10.0);
         ui.separator();
+        ui.add_space(10.0);
         ui.label(format!("{layer_name} - Pulse Height Y"));
         self.histogram_plot(ui, &y_key, "obs_y_plot", x_range, export);
     }
@@ -274,7 +386,9 @@ impl ObservationMode {
                 let col = &mut cols[(strip - 1) % 2];
                 col.label(format!("Strip {axis}{strip}"));
                 self.strip_bar_plot(col, &key, &format!("obs_strip_{axis}{strip}"), x_range, export);
+                col.add_space(10.0);
                 col.separator();
+                col.add_space(10.0);
             }
         });
     }
@@ -290,6 +404,97 @@ impl ObservationMode {
             cols[1].label(format!("{layer_name} - BGO Low Gain"));
             self.strip_bar_plot(&mut cols[1], &low_key, "obs_bgo_low", None, export);
         });
+    }
+
+    /// Data Table tab: one row per decoded particle event, every series
+    /// (each DSSD layer's X/Y pulse height, each BGO layer's High/Low gain)
+    /// together in that row under its shared `time` - unlike the Graph View
+    /// tab, this isn't scoped to the current View/Layer selection, since all
+    /// series for one event share the same timestamp anyway. Virtualized
+    /// (only visible rows are laid out each frame, via `show_rows`) since a
+    /// real file can decode thousands of events.
+    fn data_table_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.events.is_empty(), egui::Button::new("Export Table as CSV...")).clicked() {
+                self.export_table_csv();
+            }
+            ui.label(format!("{} event(s) - every series shares that event's timestamp.", self.events.len()));
+        });
+        ui.separator();
+
+        const TIME_COL_WIDTH: f32 = 170.0;
+        const VALUE_COL_WIDTH: f32 = 55.0;
+
+        egui::ScrollArea::horizontal().id_salt("obs_data_table_hscroll").show(ui, |ui| {
+            let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+
+            egui::Grid::new("obs_data_table_header").min_col_width(VALUE_COL_WIDTH).show(ui, |ui| {
+                ui.add_sized([TIME_COL_WIDTH, row_height], egui::Label::new(egui::RichText::new("Time").strong()));
+                for layer in DSSD_TABLE_LAYERS {
+                    ui.strong(format!("{layer:?}X"));
+                    ui.strong(format!("{layer:?}Y"));
+                }
+                for layer in BGO_TABLE_LAYERS {
+                    ui.strong(format!("{layer:?}H"));
+                    ui.strong(format!("{layer:?}L"));
+                }
+                ui.end_row();
+            });
+
+            egui::ScrollArea::vertical().id_salt("obs_data_table_vscroll").show_rows(ui, row_height, self.events.len(), |ui, visible_range| {
+                egui::Grid::new("obs_data_table_body").min_col_width(VALUE_COL_WIDTH).striped(true).start_row(visible_range.start).show(ui, |ui| {
+                    for event in &self.events[visible_range] {
+                        ui.add_sized([TIME_COL_WIDTH, row_height], egui::Label::new(format_event_time(event.time)));
+                        for (x, y) in event.dssd {
+                            ui.label(x.to_string());
+                            ui.label(y.to_string());
+                        }
+                        for (h, l) in event.bgo {
+                            ui.label(h.to_string());
+                            ui.label(l.to_string());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Writes the same rows `data_table_ui` renders to a CSV the user picks
+    /// a save location for.
+    fn export_table_csv(&mut self) {
+        if self.events.is_empty() {
+            self.status_message = "No events to export - run Analyze Files first.".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().set_file_name("observation_events.csv").add_filter("CSV", &["csv"]).save_file() else {
+            return;
+        };
+
+        let mut csv = String::from("time");
+        for layer in DSSD_TABLE_LAYERS {
+            csv.push_str(&format!(",{layer:?}X,{layer:?}Y"));
+        }
+        for layer in BGO_TABLE_LAYERS {
+            csv.push_str(&format!(",{layer:?}H,{layer:?}L"));
+        }
+        csv.push('\n');
+
+        for event in &self.events {
+            csv.push_str(&format_event_time(event.time));
+            for (x, y) in event.dssd {
+                csv.push_str(&format!(",{x},{y}"));
+            }
+            for (h, l) in event.bgo {
+                csv.push_str(&format!(",{h},{l}"));
+            }
+            csv.push('\n');
+        }
+
+        match std::fs::write(&path, csv) {
+            Ok(()) => self.status_message = format!("Exported {} event(s) to {}", self.events.len(), path.display()),
+            Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
+        }
     }
 
     fn histogram_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, x_range: Option<(f64, f64)>, export: &mut crate::plot_export::PlotExportQueue) {
@@ -308,8 +513,14 @@ impl ObservationMode {
     /// nothing anyway, and real data only ever populates a narrow window of
     /// the 16384-channel range, so this keeps the draw count small without
     /// changing what's visible.
+    ///
+    /// A stats line (Peak/Counts/Mean/RMS/FWHM/Res, see
+    /// `format_histogram_stats`) is drawn below every plot this way. Both
+    /// the fit (see `compute_fits`) and this stats line are restricted to
+    /// the same `x_range` used for the view - not just what's drawn - per
+    /// `dssd_x_range`'s doc comment.
     fn histogram_plot_sized(&mut self, ui: &mut egui::Ui, key: &str, id: &str, height: f32, x_range: Option<(f64, f64)>, export: &mut crate::plot_export::PlotExportQueue) {
-        self.ensure_fits(key);
+        self.ensure_fits(key, x_range);
         let hist = self.histogram_data.get(key);
         let fits = self.fit_cache.get(key);
         let in_range = |x: f64| x_range.map_or(true, |(lo, hi)| x >= lo && x <= hi);
@@ -323,7 +534,11 @@ impl ObservationMode {
                     .filter(|&(x, &c)| c > 0 && in_range(x as f64))
                     .map(|(x, &c)| Bar::new(x as f64, c as f64).width(1.0).fill(Color32::LIGHT_BLUE))
                     .collect();
-                plot_ui.bar_chart(BarChart::new(bars).name("Data"));
+                // `.color()` only fills in bars that don't already have their own
+                // fill/stroke set, so this doesn't touch the per-bar `fill` above -
+                // it just gives the chart a `default_color` so the legend swatch
+                // matches the bars instead of getting an unrelated auto-color.
+                plot_ui.bar_chart(BarChart::new(bars).name("Data").color(Color32::LIGHT_BLUE));
             }
             if let Some(fits) = fits {
                 for fit in fits {
@@ -339,31 +554,39 @@ impl ObservationMode {
                 }
             }
         });
+
+        // A visible gap plus a distinct color, so the stats line reads as
+        // its own element below the plot rather than crowding its bottom
+        // edge - the plot itself is a fixed `height`, so this space is
+        // always available, not squeezed out by the plot expanding to fill
+        // its container.
+        ui.add_space(10.0);
+        ui.colored_label(
+            Color32::from_rgb(230, 230, 230),
+            match hist {
+                Some(h) => format_histogram_stats(&self.math, h, fits.map(|f| f.as_slice()), x_range),
+                None => EMPTY_HISTOGRAM_STATS.to_string(),
+            },
+        );
+        ui.add_space(10.0);
     }
 
     fn strip_bar_plot(&mut self, ui: &mut egui::Ui, key: &str, id: &str, x_range: Option<(f64, f64)>, export: &mut crate::plot_export::PlotExportQueue) {
         self.histogram_plot_sized(ui, key, id, 180.0, x_range, export);
-
-        let hist = self.histogram_data.get(key);
-        let counts: i64 = hist.map(|h| h.iter().map(|&c| c as i64).sum()).unwrap_or(0);
-        let peak_channel = hist.and_then(|h| h.iter().enumerate().max_by_key(|&(_, &c)| c).filter(|&(_, &c)| c > 0).map(|(i, _)| i));
-
-        match peak_channel {
-            Some(ch) => ui.label(format!("Peak: {ch}   Counts: {counts}")),
-            None => ui.label("Peak: -   Counts: 0"),
-        };
     }
 
     /// Computes (and caches) the enabled fit curves for `key`'s histogram,
     /// if not already cached. The cache is cleared whenever the fit
-    /// checkboxes or the underlying histogram data change (see
-    /// `drain_messages`), so a cache hit here always reflects the current
-    /// selection.
-    fn ensure_fits(&mut self, key: &str) {
+    /// checkboxes, `dssd_x_min`/`dssd_x_max`, or the underlying histogram
+    /// data change (see `drain_messages`), so a cache hit here always
+    /// reflects the current selection - it is *not* keyed by `x_range`
+    /// itself, so callers must ensure the cache was cleared on any range
+    /// edit (see the `dssd_x_min`/`dssd_x_max` `TextEdit`s in `update`).
+    fn ensure_fits(&mut self, key: &str, x_range: Option<(f64, f64)>) {
         if self.fit_cache.contains_key(key) {
             return;
         }
-        let fits = self.compute_fits(key);
+        let fits = self.compute_fits(key, x_range);
         self.fit_cache.insert(key.to_string(), fits);
     }
 
@@ -377,19 +600,35 @@ impl ObservationMode {
     /// down to a sliver.
     const FIT_WINDOW: usize = 100;
 
-    fn compute_fits(&self, key: &str) -> Vec<ObsFitCurve> {
+    /// `x_range`, when set, restricts *which indices* of the histogram are
+    /// even considered for peak detection and fitting - not just the
+    /// window drawn - mirroring the original's raw-sample range filter (see
+    /// `dssd_x_range`'s doc comment for why this matters, particularly for
+    /// sparse per-strip histograms).
+    fn compute_fits(&self, key: &str, x_range: Option<(f64, f64)>) -> Vec<ObsFitCurve> {
         if !(self.show_gaussian_fit || self.show_lorentzian_fit || self.show_hemg_fit) {
             return Vec::new();
         }
         let Some(hist) = self.histogram_data.get(key) else {
             return Vec::new();
         };
-        let Some((peak_idx, _)) = hist.iter().enumerate().max_by_key(|&(_, &c)| c).filter(|&(_, &c)| c > 0) else {
+
+        let (range_start, range_end) = match x_range {
+            Some((lo, hi)) => ((lo.max(0.0) as usize).min(hist.len()), ((hi.max(0.0) as usize) + 1).min(hist.len())),
+            None => (0, hist.len()),
+        };
+        if range_end <= range_start {
+            return Vec::new();
+        }
+        let domain = &hist[range_start..range_end];
+
+        let Some((rel_peak_idx, _)) = domain.iter().enumerate().max_by_key(|&(_, &c)| c).filter(|&(_, &c)| c > 0) else {
             return Vec::new();
         };
+        let peak_idx = range_start + rel_peak_idx;
 
-        let start = peak_idx.saturating_sub(Self::FIT_WINDOW);
-        let end = (peak_idx + Self::FIT_WINDOW + 1).min(hist.len());
+        let start = peak_idx.saturating_sub(Self::FIT_WINDOW).max(range_start);
+        let end = (peak_idx + Self::FIT_WINDOW + 1).min(range_end);
         if end - start < 5 {
             return Vec::new();
         }
@@ -401,19 +640,49 @@ impl ObservationMode {
         if self.show_gaussian_fit {
             let res = self.math.gaussian_fit(&x_data, &y_data);
             if res.is_valid && !res.fit_curve.is_empty() {
-                fits.push(ObsFitCurve { start, curve: res.fit_curve, color: Color32::from_rgb(50, 220, 50), label: "Gaussian".to_string() });
+                fits.push(ObsFitCurve {
+                    start,
+                    curve: res.fit_curve,
+                    color: Color32::from_rgb(50, 220, 50),
+                    label: "Gaussian".to_string(),
+                    peak: res.peak,
+                    mu: res.mu,
+                    sigma: res.sigma,
+                    fwhm: res.fwhm,
+                    resolution: res.resolution,
+                });
             }
         }
         if self.show_lorentzian_fit {
             let res = self.math.lorentzian_fit(&x_data, &y_data);
             if res.is_valid && !res.fit_curve.is_empty() {
-                fits.push(ObsFitCurve { start, curve: res.fit_curve, color: Color32::from_rgb(0, 220, 220), label: "Lorentzian".to_string() });
+                fits.push(ObsFitCurve {
+                    start,
+                    curve: res.fit_curve,
+                    color: Color32::from_rgb(0, 220, 220),
+                    label: "Lorentzian".to_string(),
+                    peak: res.peak,
+                    mu: res.mu,
+                    sigma: res.sigma,
+                    fwhm: res.fwhm,
+                    resolution: res.resolution,
+                });
             }
         }
         if self.show_hemg_fit {
             let res = self.math.hemg_double_sided_fit(&x_data, &y_data, None, None);
             if res.is_valid && !res.fit_curve.is_empty() {
-                fits.push(ObsFitCurve { start, curve: res.fit_curve, color: Color32::RED, label: "HEMG".to_string() });
+                fits.push(ObsFitCurve {
+                    start,
+                    curve: res.fit_curve,
+                    color: Color32::RED,
+                    label: "HEMG".to_string(),
+                    peak: res.peak,
+                    mu: res.mu,
+                    sigma: res.sigma,
+                    fwhm: res.fwhm,
+                    resolution: res.resolution,
+                });
             }
         }
         fits
@@ -425,7 +694,6 @@ impl ObservationMode {
                 WorkerMsg::Status(s, _c) => self.status_message = s,
                 WorkerMsg::Busy(b) => self.is_busy = b,
                 WorkerMsg::InputFilesInfo(s) => self.input_files_info = s,
-                WorkerMsg::OutputFileName(s) => self.output_file_name = s,
                 WorkerMsg::HistogramData(data) => {
                     // Every processed particle contributes exactly one entry to each
                     // layer's pulse-height histograms, so any single layer's X series
@@ -435,7 +703,7 @@ impl ObservationMode {
                     self.histogram_data = data;
                     self.fit_cache.clear();
                 }
-                WorkerMsg::LastSavedPath(p) => self.last_saved_file_path = p,
+                WorkerMsg::EventData(events) => self.events = events,
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.is_busy = false;
@@ -447,11 +715,10 @@ impl ObservationMode {
     fn reset(&mut self) {
         self.input_files.clear();
         self.input_files_info = "No files selected".to_string();
-        self.output_file_name.clear();
         self.histogram_data.clear();
+        self.events.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
-        self.last_saved_file_path.clear();
         self.status_message = "Ready".to_string();
         self.progress_value = 0.0;
     }
@@ -462,7 +729,6 @@ impl ObservationMode {
         };
 
         if files.len() == 1 {
-            self.output_file_name = files[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             self.input_files = files;
             self.input_files_info = "1 file selected.".to_string();
             self.status_message = "1 file selected.".to_string();
@@ -472,21 +738,6 @@ impl ObservationMode {
             let tx = self.tx.clone();
             std::thread::spawn(move || combine_files_worker(files, tx));
         }
-    }
-
-    fn convert_files_to_excel(&mut self) {
-        if self.output_file_name.trim().is_empty() {
-            self.status_message = "Please provide a valid output Excel file name.".to_string();
-            return;
-        }
-        self.is_busy = true;
-        self.status_message = "Converting to Excel...".to_string();
-
-        let files = self.input_files.clone();
-        let output_name = self.output_file_name.clone();
-        let output_dir = self.output_directory_path.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || convert_to_excel_worker(files, output_name, output_dir, tx));
     }
 
     fn analyze_files(&mut self) {
@@ -503,9 +754,7 @@ impl ObservationMode {
 fn combine_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     match io::file_helper::combine_files(&files, "CombinedData.txt") {
         Ok(path) => {
-            let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let _ = tx.send(WorkerMsg::InputFilesInfo(format!("{} file(s) combined.", files.len())));
-            let _ = tx.send(WorkerMsg::OutputFileName(stem));
             let _ = tx.send(WorkerMsg::Status(format!("Files combined successfully into {}", path.display()), Color32::from_rgb(50, 200, 50)));
         }
         Err(e) => {
@@ -515,53 +764,21 @@ fn combine_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn convert_to_excel_worker(files: Vec<PathBuf>, output_name: String, output_dir: PathBuf, tx: Sender<WorkerMsg>) {
-    let segments = match io::segment_filter::filter_e225_segments_from_files(
-        &files,
-        baseline_core::models::shared::AppConstants::PACKET_HEX_LENGTH,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(e));
-            let _ = tx.send(WorkerMsg::Busy(false));
-            return;
-        }
-    };
-
-    if segments.is_empty() {
-        let _ = tx.send(WorkerMsg::Status("No valid segments found in the selected files.".to_string(), Color32::RED));
-        let _ = tx.send(WorkerMsg::Busy(false));
-        return;
-    }
-
-    let today = chrono::Local::now().date_naive();
-    let dir = match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(e.to_string()));
-            let _ = tx.send(WorkerMsg::Busy(false));
-            return;
-        }
-    };
-    let final_path = dir.join(format!("{}.xlsx", output_name.trim()));
-
-    match io::excel::save_lines_to_excel(&segments, &final_path) {
-        Ok(()) => {
-            let _ = tx.send(WorkerMsg::LastSavedPath(final_path.display().to_string()));
-            let _ = tx.send(WorkerMsg::Status(format!("Successfully processed {} file(s). Saved to {}", files.len(), final_path.display()), Color32::from_rgb(50, 200, 50)));
-        }
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(e));
-        }
-    }
-    let _ = tx.send(WorkerMsg::Busy(false));
-}
-
 fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     let mut processor = ObservationDataProcessor::new();
     match processor.process_files(&files) {
         Ok(histogram_data) => {
+            let events: Vec<EventRow> = processor
+                .results
+                .into_iter()
+                .map(|r| EventRow {
+                    time: r.time,
+                    dssd: DSSD_TABLE_LAYERS.map(|layer| r.dssd_pulses.get(&layer).copied().unwrap_or((0, 0))),
+                    bgo: BGO_TABLE_LAYERS.map(|layer| r.bgo_pulses.get(&layer).copied().unwrap_or((0, 0))),
+                })
+                .collect();
             let _ = tx.send(WorkerMsg::HistogramData(histogram_data));
+            let _ = tx.send(WorkerMsg::EventData(events));
             let _ = tx.send(WorkerMsg::Status("Processing complete!".to_string(), Color32::from_rgb(50, 200, 50)));
         }
         Err(e) => {
@@ -570,3 +787,4 @@ fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     }
     let _ = tx.send(WorkerMsg::Busy(false));
 }
+

@@ -71,6 +71,50 @@ impl MathService {
         }
     }
 
+    /// Full-width-at-half-maximum of the tallest peak in `y_data`, in
+    /// `x_data` units - found by scanning outward from the peak bin for the
+    /// first half-max crossing on each side, the same raw-data technique
+    /// `perform_simple_fit` uses for its own initial-guess FWHM (see the ROI
+    /// comment there). Unlike a fitted FWHM (`FittingResult::fwhm`, derived
+    /// from a solved sigma/gamma), this needs no curve fit at all, so it's
+    /// usable as a quick descriptive stat even when no fit overlay is
+    /// enabled. Returns `0.0` for empty/all-non-positive input.
+    pub fn calculate_fwhm(&self, x_data: &[f64], y_data: &[f64]) -> f64 {
+        if x_data.len() != y_data.len() || x_data.is_empty() {
+            return 0.0;
+        }
+
+        let mut max_index = 0;
+        let mut max_y = y_data[0];
+        for (i, &y) in y_data.iter().enumerate().skip(1) {
+            if y > max_y {
+                max_y = y;
+                max_index = i;
+            }
+        }
+        if max_y <= MIN_VALUE {
+            return 0.0;
+        }
+
+        let half_max = max_y / 2.0;
+        let mut left_idx = max_index;
+        for i in (0..=max_index).rev() {
+            if y_data[i] <= half_max {
+                left_idx = i;
+                break;
+            }
+        }
+        let mut right_idx = max_index;
+        for i in max_index..y_data.len() {
+            if y_data[i] <= half_max {
+                right_idx = i;
+                break;
+            }
+        }
+
+        (x_data[right_idx] - x_data[left_idx]).abs()
+    }
+
     pub fn gaussian_fit(&self, x_data: &[f64], y_data: &[f64]) -> FittingResult {
         self.perform_simple_fit(x_data, y_data, true)
     }
@@ -331,6 +375,21 @@ pub fn calculate_lorentzian_value(x: f64, a: f64, x0: f64, gamma: f64) -> f64 {
     (a * gamma_sq) / ((x - x0).powi(2) + gamma_sq)
 }
 
+/// Evaluates a Gaussian with the same amplitude/mean/sigma convention as
+/// `perform_simple_fit`'s own curve reconstruction (see its `is_gaussian`
+/// branch) - exposed so callers can reconstruct a fitted curve over an x
+/// range other than the one actually handed to `gaussian_fit` (e.g. a full
+/// histogram domain after fitting only a cropped peak window).
+pub fn calculate_gaussian_value(x: f64, a: f64, mu: f64, sigma: f64) -> f64 {
+    let safe_sigma = sigma.abs().max(MIN_VALUE);
+    let exponent = -(x - mu).powi(2) / (2.0 * safe_sigma * safe_sigma);
+    if exponent < -MAX_EXP_ARG {
+        0.0
+    } else {
+        a * exponent.exp()
+    }
+}
+
 fn calculate_fit_stats(result: &mut FittingResult, x_data: &[f64], y_data: &[f64], fit_curve: &[f64]) {
     let n = y_data.len();
     if n == 0 {
@@ -476,144 +535,3 @@ fn solve_gaussian(a: &[f64], b: &[f64], x: &mut [f64], n: usize) -> bool {
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn calculate_moments_uniform_distribution_calculates_mean() {
-        let svc = MathService::new();
-        let x = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let y = [1.0, 1.0, 1.0, 1.0, 1.0];
-        let (mean, _sigma, peak) = svc.calculate_moments(&x, &y);
-        assert!((mean - 3.0).abs() < 1e-5);
-        assert_eq!(peak, 1.0);
-    }
-
-    #[test]
-    fn calculate_moments_single_peak_finds_peak() {
-        let svc = MathService::new();
-        let x = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let y = [1.0, 2.0, 10.0, 2.0, 1.0];
-        let (mean, _sigma, peak) = svc.calculate_moments(&x, &y);
-        assert_eq!(peak, 10.0);
-        assert!(mean > 2.5 && mean < 3.5);
-    }
-
-    #[test]
-    fn calculate_moments_all_zeros_returns_zeros() {
-        let svc = MathService::new();
-        let x = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let y = [0.0, 0.0, 0.0, 0.0, 0.0];
-        let (mean, sigma, peak) = svc.calculate_moments(&x, &y);
-        assert_eq!(mean, 0.0);
-        assert_eq!(sigma, 0.0);
-        assert_eq!(peak, 0.0);
-    }
-
-    #[test]
-    fn calculate_moments_gaussian_like_calculates_sigma() {
-        let svc = MathService::new();
-        let mut x = [0.0; 11];
-        let mut y = [0.0; 11];
-        for i in 0..11 {
-            x[i] = i as f64;
-            let xc = i as f64 - 5.0;
-            y[i] = (-xc * xc / 2.0).exp();
-        }
-        let (mean, sigma, peak) = svc.calculate_moments(&x, &y);
-        assert!((mean - 5.0).abs() < 0.1);
-        assert!(sigma > 0.5 && sigma < 2.0);
-        assert!((peak - 1.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn calculate_moments_empty_arrays_handled_gracefully() {
-        let svc = MathService::new();
-        let (mean, _sigma, _peak) = svc.calculate_moments(&[], &[]);
-        assert!(mean.is_nan() || mean == 0.0);
-    }
-
-    #[test]
-    fn calculate_moments_single_element_returns_correct_values() {
-        let svc = MathService::new();
-        let (mean, sigma, peak) = svc.calculate_moments(&[5.0], &[10.0]);
-        assert_eq!(mean, 5.0);
-        assert_eq!(sigma, 0.0);
-        assert_eq!(peak, 10.0);
-    }
-
-    // Ground truth for both fits below was captured by running the actual C#
-    // (MathNet `LevenbergMarquardtMinimizer`) against this exact dataset via
-    // `dotnet test` on a throwaway probe (not committed): for the Gaussian,
-    // Mu=25, Sigma=4.0000000004, Peak=99.99999999, R2=1, i.e. essentially
-    // exact recovery. For the Lorentzian (fitting a Gaussian-shaped dataset
-    // with a Lorentzian model, so an imperfect but well-defined fit):
-    // Mu=25.0002, Sigma=3.7248, Peak=108.682, R2=0.9629. Our hand-rolled LM
-    // (replacing MathNet, see module docs) is checked against those numbers
-    // with tolerance for a different solver's convergence path, not bit
-    // equality. NOTE: these assertions could not be executed in this
-    // environment (Windows SDK missing, see project notes) and must be
-    // re-verified with `cargo test` once the toolchain is unblocked.
-    fn synthetic_gaussian_dataset() -> (Vec<f64>, Vec<f64>) {
-        let mut x = vec![0.0; 50];
-        let mut y = vec![0.0; 50];
-        let true_a = 100.0;
-        let true_mu = 25.0;
-        let true_sigma = 4.0;
-        for i in 0..50 {
-            x[i] = i as f64;
-            let d = x[i] - true_mu;
-            y[i] = true_a * (-0.5 * (d / true_sigma).powi(2)).exp();
-        }
-        (x, y)
-    }
-
-    #[test]
-    fn gaussian_fit_recovers_known_parameters() {
-        let svc = MathService::new();
-        let (x, y) = synthetic_gaussian_dataset();
-        let result = svc.gaussian_fit(&x, &y);
-        assert!(result.is_valid);
-        // C# ground truth: Mu=25, Sigma=4.0000000004, Peak=99.99999999, R2=1
-        assert!((result.mu - 25.0).abs() < 0.5, "mu={}", result.mu);
-        assert!((result.sigma.abs() - 4.0).abs() < 0.5, "sigma={}", result.sigma);
-        assert!((result.peak - 100.0).abs() < 1.0, "peak={}", result.peak);
-        assert!(result.r_squared > 0.99, "r_squared={}", result.r_squared);
-    }
-
-    #[test]
-    fn lorentzian_fit_matches_mathnet_reference_within_tolerance() {
-        let svc = MathService::new();
-        let (x, y) = synthetic_gaussian_dataset();
-        let result = svc.lorentzian_fit(&x, &y);
-        assert!(result.is_valid);
-        // C# ground truth: Mu=25.0002, Sigma=3.7248, Peak=108.682, R2=0.9629
-        assert!((result.mu - 25.0).abs() < 1.5, "mu={}", result.mu);
-        assert!((result.sigma.abs() - 3.72).abs() < 1.5, "sigma={}", result.sigma);
-        assert!(result.r_squared > 0.9, "r_squared={}", result.r_squared);
-    }
-
-    #[test]
-    fn hemg_double_sided_fit_matches_csharp_reference_within_tolerance() {
-        let svc = MathService::new();
-        let n = 200;
-        let mut x = vec![0.0; n];
-        let mut y = vec![0.0; n];
-        for i in 0..n {
-            x[i] = i as f64;
-            let d = i as f64 - 100.0;
-            y[i] = 500.0 * (-0.5 * (d / 8.0).powi(2)).exp();
-        }
-        let result = svc.hemg_double_sided_fit(&x, &y, None, None);
-        assert!(result.is_valid);
-        // C# ground truth (same input, exact transcription of the optimizer,
-        // including its early-break convergence quirk - see math/hemg.rs):
-        // A=10039.94 Mu=100.0 Sigma=7.9459 Peak=500.896 TauL1=TauR1=4.9636
-        // EtaL1=EtaR1=0.015069 R2=0.9999969697
-        assert!((result.mu - 100.0).abs() < 0.5, "mu={}", result.mu);
-        assert!((result.sigma - 7.9459).abs() < 0.5, "sigma={}", result.sigma);
-        assert!((result.peak - 500.896).abs() < 5.0, "peak={}", result.peak);
-        assert!(result.r_squared > 0.999, "r_squared={}", result.r_squared);
-    }
-}

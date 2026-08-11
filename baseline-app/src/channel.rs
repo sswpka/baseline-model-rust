@@ -87,14 +87,17 @@ impl ChannelState {
                         let first = self.counts.iter().position(|&y| y > 0.0);
                         let last = self.counts.iter().rposition(|&y| y > 0.0);
                         if let (Some(first), Some(last)) = (first, last) {
-                            // `BarChart::color` fills bars at 20% opacity (it's meant to
-                            // pair with a solid stroke); set `fill` directly on each bar
-                            // instead so the histogram reads as a solid-color chart.
+                            // Bars get their solid `fill` set directly (rather than via
+                            // `BarChart::color`, which would fill at 20% opacity for a
+                            // stroke pairing) so the histogram reads as solid-color; the
+                            // chart-level `.color()` below only sets `default_color` for
+                            // the legend swatch, since it skips bars that already have a
+                            // fill/stroke.
                             let bars: Vec<Bar> = (first..=last)
                                 .filter(|&i| self.counts[i] > 0.0)
                                 .map(|i| Bar::new(self.bin_centers[i], self.counts[i]).width(bar_width).fill(Color32::LIGHT_BLUE).stroke(egui::Stroke::NONE))
                                 .collect();
-                            plot_ui.bar_chart(BarChart::new(bars).name("Data"));
+                            plot_ui.bar_chart(BarChart::new(bars).name("Data").color(Color32::LIGHT_BLUE));
 
                             for fit in &self.active_fits {
                                 if fit.curve.len() == self.bin_centers.len() {

@@ -2,6 +2,7 @@ mod app;
 mod baseline_mode;
 mod calibration_mode;
 mod channel;
+mod fit_overlay;
 mod flux_mode;
 mod observation_mode;
 mod plot_export;

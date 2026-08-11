@@ -118,7 +118,18 @@ pub fn show<R>(
     build_fn: impl FnOnce(&mut egui_plot::PlotUi) -> R,
 ) -> R {
     let plot = if export.zoom_to_fit.remove(id_source) { plot.reset() } else { plot };
+
+    // Mutated in place (not via `ui.scope`, which would parent the plot under
+    // a fresh auto-id `Ui` and change what `ui.make_persistent_id(id_source)`
+    // resolves to inside `Plot::show`, orphaning any saved pan/zoom state) and
+    // restored right after, since callers keep drawing on this same `ui`
+    // (e.g. the stats label below `histogram_plot_sized`'s plot) and
+    // shouldn't inherit the plot-only background.
+    let old_bg = ui.visuals().extreme_bg_color;
+    ui.visuals_mut().extreme_bg_color = egui::Color32::from_gray(100);
     let response = plot.show(ui, build_fn);
+    ui.visuals_mut().extreme_bg_color = old_bg;
+
     let rect = response.response.rect;
 
     response.response.context_menu(|ui| {

@@ -2,9 +2,9 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Debug baseline-app",
             "type": "lldb",
             "request": "launch",
-            "name": "Debug baseline-app",
             "cargo": {
                 "args": ["build", "-p", "baseline-app"],
                 "filter": {
@@ -13,7 +13,31 @@
                 }
             },
             "args": [],
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": [
+                "rust"
+            ],
+            "env": {
+                "RUST_BACKTRACE": "1"
+            }
+        },
+        {
+            "name": "Run baseline-app (Release)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/release/baseline-app.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/target/release",
+            "preLaunchTask": "cargo build (baseline-app release)",
+            "sourceLanguages": [
+                "rust"
+            ]
+        },
+        {
+            "name": "Attach to baseline-app",
+            "type": "lldb",
+            "request": "attach",
+            "program": "${workspaceFolder}/target/debug/baseline-app.exe"
         }
     ]
 }

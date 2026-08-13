@@ -124,11 +124,19 @@ pub fn show<R>(
     // resolves to inside `Plot::show`, orphaning any saved pan/zoom state) and
     // restored right after, since callers keep drawing on this same `ui`
     // (e.g. the stats label below `histogram_plot_sized`'s plot) and
-    // shouldn't inherit the plot-only background.
+    // shouldn't inherit the plot-only background/text color.
+    //
+    // `override_text_color` goes along with it: egui_plot draws axis tick
+    // labels and the background grid from `ui.visuals().text_color()`
+    // (see `color_from_strength`), which defaults to a light color for this
+    // app's dark theme - unreadable against a white plot background.
     let old_bg = ui.visuals().extreme_bg_color;
-    ui.visuals_mut().extreme_bg_color = egui::Color32::from_gray(100);
+    let old_text = ui.visuals().override_text_color;
+    ui.visuals_mut().extreme_bg_color = egui::Color32::WHITE;
+    ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
     let response = plot.show(ui, build_fn);
     ui.visuals_mut().extreme_bg_color = old_bg;
+    ui.visuals_mut().override_text_color = old_text;
 
     let rect = response.response.rect;
 

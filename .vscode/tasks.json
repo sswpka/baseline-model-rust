@@ -1,16 +1,36 @@
 {
     "version": "2.0.0",
+    "options": {
+        "env": {
+            "Path": "${env:Path};${env:USERPROFILE}\\.cargo\\bin"
+        }
+    },
     "tasks": [
         {
             "label": "cargo build (baseline-app debug)",
-            "type": "cargo",
-            "command": "build",
-            "args": ["-p", "baseline-app"],
-            "problemMatcher": ["$rustc"],
+            "type": "shell",
+            "command": "cargo build -p baseline-app",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             }
+        },
+        {
+            "label": "cargo build (baseline-app release)",
+            "type": "shell",
+            "command": "cargo build -p baseline-app --release",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ]
         }
     ]
 }

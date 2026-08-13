@@ -34,6 +34,18 @@ pub struct ParticleResult {
     pub dssd_pulses: HashMap<DetectorLayer, (i32, i32)>,
     /// (High gain, Low gain) pulse heights per BGO layer.
     pub bgo_pulses: HashMap<BgoLayer, (i32, i32)>,
+    /// Line header fields surrounding the byte 8-13 timecode - see
+    /// `parse_line_header_fields`. Line-level, not particle-level: every
+    /// particle on the same line carries the same five values, matching how
+    /// they all share the line's timecode. `packet_sync`/`data_type` stay
+    /// raw hex (e.g. `"E225"`) - they're markers/type codes, not
+    /// measurements; `package_id`/`packet_sequence`/`packet_data_length` are
+    /// decoded to decimal, like the rest of the payload.
+    pub packet_sync: String,
+    pub package_id: i32,
+    pub packet_sequence: i32,
+    pub packet_data_length: i32,
+    pub data_type: String,
 }
 
 pub struct ObservationDataProcessor {
@@ -129,7 +141,8 @@ impl ObservationDataProcessor {
                 // entirely, matching `get_date_time_from_hex`'s epoch
                 // fallback in `flux::processing`.
                 let line_time = get_date_time_from_hex_data(&hex_data).unwrap_or_else(|_| DateTime::from_timestamp(0, 0).unwrap());
-                self.process_particles(&hex_data, line_time);
+                let header = parse_line_header_fields(&hex_data).unwrap_or_default();
+                self.process_particles(&hex_data, line_time, &header);
             }
         }
         Ok(())
@@ -219,7 +232,7 @@ impl ObservationDataProcessor {
         result
     }
 
-    pub fn process_particles(&mut self, hex_data: &[String], line_time: DateTime<Utc>) {
+    pub fn process_particles(&mut self, hex_data: &[String], line_time: DateTime<Utc>, header: &LineHeaderFields) {
         for i in 0..PARTICLES_PER_LINE {
             let start = HEADER_OFFSET + PARTICLE_DATA_LENGTH * i;
             if start >= hex_data.len() {
@@ -231,13 +244,13 @@ impl ObservationDataProcessor {
                 break;
             }
 
-            if let Ok(processed) = self.process_particle_data(particle_data, i, line_time) {
+            if let Ok(processed) = self.process_particle_data(particle_data, i, line_time, header) {
                 self.results.push(processed);
             }
         }
     }
 
-    pub fn process_particle_data(&mut self, particle_data: &[String], i: usize, line_time: DateTime<Utc>) -> Result<ParticleResult, String> {
+    pub fn process_particle_data(&mut self, particle_data: &[String], i: usize, line_time: DateTime<Utc>, header: &LineHeaderFields) -> Result<ParticleResult, String> {
         let particle_data_dec: Vec<i32> = particle_data
             .iter()
             .map(|hex| i32::from_str_radix(hex, 16).map_err(|e| e.to_string()))
@@ -277,6 +290,11 @@ impl ObservationDataProcessor {
             time,
             dssd_pulses,
             bgo_pulses,
+            packet_sync: header.packet_sync.clone(),
+            package_id: header.package_id,
+            packet_sequence: header.packet_sequence,
+            packet_data_length: header.packet_data_length,
+            data_type: header.data_type.clone(),
         })
     }
 
@@ -398,6 +416,42 @@ pub fn get_date_time_from_hex_data(hex_data: &[String]) -> Result<DateTime<Utc>,
     let milliseconds_part = u16::from_be_bytes([timecode_dec[4], timecode_dec[5]]);
 
     Ok(observation_epoch() + chrono::Duration::seconds(seconds_part as i64) + chrono::Duration::milliseconds(milliseconds_part as i64))
+}
+
+/// The line-header fields surrounding the byte 8-13 timecode - see
+/// `parse_line_header_fields`. `packet_sync`/`data_type` stay raw hex (e.g.
+/// `"E225"`) since they're a fixed marker and a type code, not measurements;
+/// the rest decode to decimal like the rest of the payload.
+#[derive(Debug, Clone, Default)]
+pub struct LineHeaderFields {
+    pub packet_sync: String,
+    pub package_id: i32,
+    pub packet_sequence: i32,
+    pub packet_data_length: i32,
+    pub data_type: String,
+}
+
+/// Decodes the line-header fields around the timecode: Packet Sync Code
+/// (bytes 0-1, raw hex), Package ID (2-3, decimal), Packet Sequence (4-5,
+/// decimal), Packet Data Length (6-7, decimal), the byte 8-13 timecode
+/// itself (`get_date_time_from_hex_data`, decoded separately), then Data
+/// Type (14-15, raw hex) - mirrors the identical 16-byte header layout
+/// `flux::processing::process_header_internal` decodes for its own (much
+/// larger) E225 packets.
+pub fn parse_line_header_fields(hex_data: &[String]) -> Option<LineHeaderFields> {
+    if hex_data.len() < 16 {
+        return None;
+    }
+    let hex_pair = |i: usize| format!("{}{}", hex_data[i], hex_data[i + 1]);
+    let byte = |i: usize| i32::from_str_radix(&hex_data[i], 16).ok();
+    let dec_pair = |i: usize| Some((byte(i)? << 8) + byte(i + 1)?);
+    Some(LineHeaderFields {
+        packet_sync: hex_pair(0),
+        package_id: dec_pair(2)?,
+        packet_sequence: dec_pair(4)?,
+        packet_data_length: dec_pair(6)?,
+        data_type: hex_pair(14),
+    })
 }
 
 pub fn split_hex_data(hex_string: &str) -> Vec<String> {

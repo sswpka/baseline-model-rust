@@ -1,8 +1,4 @@
-//! Top-level app shell, matching `ModeSelectorWindow` + `UnifiedMainWindow`:
-//! a persistent top navigation bar picks the mode, shown alongside that
-//! mode's screen. All four modes are wired up; see each mode module's doc
-//! comment for what was deliberately deferred (detail/zoom windows,
-//! manual-fit UI, coincidence-matrix heatmap).
+//! Top-level app
 
 use crate::baseline_mode::BaselineMode;
 use crate::calibration_mode::CalibrationMode;

@@ -15,12 +15,13 @@
 
 use baseline_core::math::MathService;
 use baseline_core::models::observation::{BgoLayer, DetectorLayer};
-use baseline_core::observation::ObservationDataProcessor;
+use baseline_core::observation::{ObservationDataProcessor, LINE_TAIL_FIELDS};
 use chrono::{DateTime, Utc};
 use egui::Color32;
 use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 /// DSSD/BGO layers in the Data Table tab's fixed column order
@@ -32,24 +33,20 @@ const DSSD_TABLE_LAYERS: [DetectorLayer; 4] = [
 ];
 const BGO_TABLE_LAYERS: [BgoLayer; 3] = [BgoLayer::L3, BgoLayer::L4, BgoLayer::L5];
 
-/// Byte offsets within one particle's 34-byte payload that each DSSD X/Y
-/// pulse height is decoded from - mirrors the index comments in
-/// `ObservationDataProcessor::process_particle_data` ("L1: ... X-Ph idx 3-4,
-/// Y-Ph idx 5-6", etc.) - shown in the Data Table's column headers.
-fn dssd_byte_range(layer: DetectorLayer) -> (&'static str, &'static str) {
+/// 0-indexed byte offsets within one particle's 34-byte payload for each
+/// DSSD layer's XY Position / X Pulse Height / Y Pulse Height fields.
+fn dssd_byte_ranges(layer: DetectorLayer) -> (&'static str, &'static str, &'static str) {
     match layer {
-        DetectorLayer::L1 => ("3-4", "5-6"),
-        DetectorLayer::L2 => ("8-9", "10-11"),
-        DetectorLayer::L6 => ("25-26", "27-28"),
-        DetectorLayer::L7 => ("30-31", "32-33"),
+        DetectorLayer::L1 => ("2", "3-4", "5-6"),
+        DetectorLayer::L2 => ("7", "8-9", "10-11"),
+        DetectorLayer::L6 => ("24", "25-26", "27-28"),
+        DetectorLayer::L7 => ("29", "30-31", "32-33"),
     }
 }
 
-/// Byte offsets within one particle's 34-byte payload that each BGO
-/// High/Low gain is decoded from - mirrors `process_particle_data`'s "L3: H
-/// idx 12-13, L idx 14-15" comments - shown in the Data Table's column
-/// headers.
-fn bgo_byte_range(layer: BgoLayer) -> (&'static str, &'static str) {
+/// 0-indexed byte offsets within one particle's 34-byte payload for each
+/// BGO layer's High-Gain / Low-Gain Pulse Height fields.
+fn bgo_byte_ranges(layer: BgoLayer) -> (&'static str, &'static str) {
     match layer {
         BgoLayer::L3 => ("12-13", "14-15"),
         BgoLayer::L4 => ("16-17", "18-19"),
@@ -57,11 +54,27 @@ fn bgo_byte_range(layer: BgoLayer) -> (&'static str, &'static str) {
     }
 }
 
-/// Whether the Data Table should show DSSD or BGO columns for the current
-/// top `View:` selector - the two groups are mutually exclusive, matching
-/// the Graph View tab's own DSSD-vs-BGO split (`ObservationViewMode`).
+/// "(Particle Byte N)" - disambiguates these particle-block-relative,
+/// 0-indexed offsets from the line-level "(Byte N)" header/tail labels,
+/// which are 0-indexed absolute offsets into the whole line (a different
+/// base position, same indexing convention).
+fn particle_byte_label(range: &str) -> String {
+    format!("(Particle Byte {range})")
+}
+
 fn data_table_shows_dssd(view_mode: ObservationViewMode) -> bool {
     view_mode != ObservationViewMode::Bgo
+}
+
+/// "{label} (Byte {n})" for a 1-byte field, "{label} (Byte {n}-{m})" for a
+/// 2-byte one - matches the "(Byte X-Y)" style of the other Data Table headers.
+fn line_extra_header(field: &baseline_core::observation::LineTailField) -> String {
+    let byte_range = if field.byte_len == 1 {
+        field.byte_start.to_string()
+    } else {
+        format!("{}-{}", field.byte_start, field.byte_start + field.byte_len - 1)
+    };
+    format!("{} (Byte {byte_range})", field.label)
 }
 
 /// One decoded particle event for the Data Table tab: every series (each
@@ -79,18 +92,19 @@ fn data_table_shows_dssd(view_mode: ObservationViewMode) -> bool {
 /// choice into the stored event.
 #[derive(Debug, Clone)]
 struct EventRow {
-    /// Line header fields surrounding the timecode (see
-    /// `ParticleResult`/`LineHeaderFields`) - same value for every particle
-    /// on the same line. `packet_sync`/`data_type` are raw hex (e.g.
-    /// `"E225"`); the rest are decimal.
     packet_sync: String,
     package_id: i32,
     packet_sequence: i32,
     packet_data_length: i32,
     time: DateTime<Utc>,
     data_type: String,
+    particle_time_raw: i32,
+    dssd_position: [i32; 4],
     dssd: [(i32, i32); 4],
     bgo: [(i32, i32); 3],
+    /// Raw values for `baseline_core::observation::LINE_TAIL_FIELDS`, in
+    /// that same order.
+    line_extra: Arc<[String]>,
 }
 
 /// 14-bit ADC channel -> volts
@@ -103,13 +117,9 @@ fn format_event_time(time: DateTime<Utc>) -> String {
     time.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
-/// A fixed-width stand-in for any `format_event_time` output (same digit/
-/// separator layout, so same rendered width regardless of the actual date)
-/// - used to size the Time column against its content, not just its header.
 const TIME_SAMPLE_TEXT: &str = "0000-00-00 00:00:00.000";
 
-/// Rendered pixel width of `text` in the current `Body` text style, via
-/// egui's memoized text layout - cheap even called repeatedly per frame.
+/// Rendered pixel width of `text` in the current `Body` text style
 fn text_render_width(ui: &egui::Ui, text: &str) -> f32 {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     ui.fonts(|f| {
@@ -119,9 +129,7 @@ fn text_render_width(ui: &egui::Ui, text: &str) -> f32 {
     })
 }
 
-/// Data Table column width for a given header label: the wider of the
-/// header text and (for Time) `TIME_SAMPLE_TEXT`, plus padding for the cell
-/// margin, with a floor so short headers don't get too cramped.
+/// Func for fitting the width of the Data table's column headers to their content
 fn header_column_width(ui: &egui::Ui, header: &str) -> f32 {
     const PADDING: f32 = 20.0;
     const MIN_WIDTH: f32 = 60.0;
@@ -210,19 +218,12 @@ enum ObservationViewMode {
     Bgo,
 }
 
-/// Which unit the Data Table's DSSD X/Y columns are shown in - a per-table
-/// toggle, not tied to `ObservationViewMode`, since ADC vs Voltage is a
-/// display choice orthogonal to which layer/view is selected. BGO has no
-/// equivalent: it's always shown raw (see `data_table_ui`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DssdDataUnit {
     Adc,
     Voltage,
 }
 
-/// Which of the two top-level tabs the central panel is showing: the
-/// grid-of-plots view, or a flat, event-by-event table (see `EventRow`) of
-/// every decoded particle's DSSD/BGO series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservationTab {
     GraphView,
@@ -269,8 +270,6 @@ pub struct ObservationMode {
     /// Data Table tab's event-by-event rows, populated alongside
     /// `histogram_data` by `analyze_files_worker`.
     events: Vec<EventRow>,
-    /// Data Table tab's ADC-vs-Voltage toggle for its DSSD X/Y columns (see
-    /// `DssdDataUnit`).
     dssd_data_unit: DssdDataUnit,
 
     /// Fit/View ROI text fields for the DSSD Pulse Height/X-Strip/Y-Strip
@@ -287,10 +286,7 @@ pub struct ObservationMode {
     show_gaussian_fit: bool,
     show_lorentzian_fit: bool,
     show_hemg_fit: bool,
-    /// Fit curves computed lazily per histogram key and cached until the
-    /// underlying histogram data or the fit checkboxes change - a fresh
-    /// Levenberg-Marquardt solve per frame would be far too slow for
-    /// immediate-mode redraw.
+
     fit_cache: HashMap<String, Vec<ObsFitCurve>>,
     math: MathService,
 
@@ -564,13 +560,13 @@ impl ObservationMode {
         let y_key = format!("DSSD{layer_name}_Y");
         let x_range = self.dssd_x_range();
 
-        ui.label(format!("{layer_name} - Pulse Height X"));
-        self.histogram_plot(ui, &x_key, "obs_x_plot", x_range, export);
+        let header = ui.label(format!("{layer_name} - Pulse Height X"));
+        self.histogram_plot(ui, &x_key, "obs_x_plot", Some(header.rect), x_range, export);
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(10.0);
-        ui.label(format!("{layer_name} - Pulse Height Y"));
-        self.histogram_plot(ui, &y_key, "obs_y_plot", x_range, export);
+        let header = ui.label(format!("{layer_name} - Pulse Height Y"));
+        self.histogram_plot(ui, &y_key, "obs_y_plot", Some(header.rect), x_range, export);
     }
 
     /// `axis` is `'X'` or `'Y'`, selecting the X-Strip or Y-Strip view.
@@ -589,11 +585,12 @@ impl ObservationMode {
             for strip in 1..=8 {
                 let key = format!("DSSD{layer_name}_Strip{axis}{strip}");
                 let col = &mut cols[(strip - 1) % 2];
-                col.label(format!("Strip {axis}{strip}"));
+                let header = col.label(format!("Strip {axis}{strip}"));
                 self.strip_bar_plot(
                     col,
                     &key,
                     &format!("obs_strip_{axis}{strip}"),
+                    Some(header.rect),
                     x_range,
                     export,
                 );
@@ -611,32 +608,28 @@ impl ObservationMode {
         let x_range = self.bgo_x_range();
 
         ui.columns(2, |cols| {
-            cols[0].label(format!("{layer_name} - BGO High Gain"));
-            self.strip_bar_plot(&mut cols[0], &high_key, "obs_bgo_high", x_range, export);
-            cols[1].label(format!("{layer_name} - BGO Low Gain"));
-            self.strip_bar_plot(&mut cols[1], &low_key, "obs_bgo_low", x_range, export);
+            let header = cols[0].label(format!("{layer_name} - BGO High Gain"));
+            self.strip_bar_plot(
+                &mut cols[0],
+                &high_key,
+                "obs_bgo_high",
+                Some(header.rect),
+                x_range,
+                export,
+            );
+            let header = cols[1].label(format!("{layer_name} - BGO Low Gain"));
+            self.strip_bar_plot(
+                &mut cols[1],
+                &low_key,
+                "obs_bgo_low",
+                Some(header.rect),
+                x_range,
+                export,
+            );
         });
     }
 
-    /// Data Table tab: one row per decoded particle event. Columns are
-    /// scoped to the current top `View:` selector - DSSD Pulse
-    /// Height/X-Strip/Y-Strip show only the DSSD X/Y columns, BGO shows only
-    /// the BGO High/Low columns (see `data_table_shows_dssd`) - and every
-    /// column header names the byte offsets (within one particle's 34-byte
-    /// payload) it was decoded from. When DSSD columns are shown, the ADC/
-    /// Voltage toggle (`dssd_data_unit`) picks whether they display the raw
-    /// decoded channel or `adc_to_volts` of it; BGO is always raw.
-    ///
-    /// The five line-header columns (Packet Sync Code/Package ID/Packet
-    /// Seq/Packet Data Len before Time, Data Type after) are always shown,
-    /// in their actual byte order, since they're line-level, not
-    /// DSSD/BGO-specific. Packet Sync Code and Data Type display raw hex
-    /// (e.g. `"E225"`); the other three are decimal.
-    ///
-    /// Each column's width is measured from its own header text
-    /// (`header_column_width`) rather than one fixed width shared by every
-    /// column - the header row and every body row are built from the same
-    /// `headers`-derived `widths` so they line up.
+    /// Data Table tab: one row per decoded particle event, with the DSSD/BGO columns
     fn data_table_ui(&mut self, ui: &mut egui::Ui) {
         let show_dssd = data_table_shows_dssd(self.view_mode);
 
@@ -667,19 +660,24 @@ impl ObservationMode {
             "Packet Data Len (Byte 6-7)".to_string(),
             "Time (Byte 8-13)".to_string(),
             "Data Type (Byte 14-15)".to_string(),
+            format!("Particle Time {}", particle_byte_label("0-1")),
         ];
         if show_dssd {
             for layer in DSSD_TABLE_LAYERS {
-                let (x_range, y_range) = dssd_byte_range(layer);
-                headers.push(format!("{layer:?}X (Byte {x_range})"));
-                headers.push(format!("{layer:?}Y (Byte {y_range})"));
+                let (pos_range, x_range, y_range) = dssd_byte_ranges(layer);
+                headers.push(format!("{layer:?} XY Position {}", particle_byte_label(pos_range)));
+                headers.push(format!("{layer:?} X Pulse Height {}", particle_byte_label(x_range)));
+                headers.push(format!("{layer:?} Y Pulse Height {}", particle_byte_label(y_range)));
             }
         } else {
             for layer in BGO_TABLE_LAYERS {
-                let (h_range, l_range) = bgo_byte_range(layer);
-                headers.push(format!("{layer:?}H (Byte {h_range})"));
-                headers.push(format!("{layer:?}L (Byte {l_range})"));
+                let (h_range, l_range) = bgo_byte_ranges(layer);
+                headers.push(format!("{layer:?} High-Gain Pulse Height {}", particle_byte_label(h_range)));
+                headers.push(format!("{layer:?} Low-Gain Pulse Height {}", particle_byte_label(l_range)));
             }
+        }
+        for field in LINE_TAIL_FIELDS {
+            headers.push(line_extra_header(field));
         }
         let widths: Vec<f32> = headers.iter().map(|h| header_column_width(ui, h)).collect();
 
@@ -714,9 +712,15 @@ impl ObservationMode {
                                         event.packet_data_length.to_string(),
                                         format_event_time(event.time),
                                         event.data_type.clone(),
+                                        event.particle_time_raw.to_string(),
                                     ];
                                     if show_dssd {
-                                        for (x, y) in event.dssd {
+                                        for (pos, (x, y)) in event
+                                            .dssd_position
+                                            .into_iter()
+                                            .zip(event.dssd)
+                                        {
+                                            cells.push(pos.to_string());
                                             cells.push(self.format_dssd_value(x));
                                             cells.push(self.format_dssd_value(y));
                                         }
@@ -725,6 +729,9 @@ impl ObservationMode {
                                             cells.push(h.to_string());
                                             cells.push(l.to_string());
                                         }
+                                    }
+                                    for value in event.line_extra.iter() {
+                                        cells.push(value.clone());
                                     }
                                     for (cell, &width) in cells.iter().zip(&widths) {
                                         ui.add_sized([width, row_height], egui::Label::new(cell));
@@ -737,7 +744,6 @@ impl ObservationMode {
     }
 
     /// Renders one DSSD X/Y cell per `dssd_data_unit`: the raw ADC channel,
-    /// or its `adc_to_volts` conversion to 4 decimal places.
     fn format_dssd_value(&self, adc: i32) -> String {
         match self.dssd_data_unit {
             DssdDataUnit::Adc => adc.to_string(),
@@ -745,11 +751,7 @@ impl ObservationMode {
         }
     }
 
-    /// Export the data table as csv. Column set and header text mirror
-    /// `data_table_ui` exactly - same DSSD-vs-BGO filtering (`show_dssd`),
-    /// same "(Byte x-y)" labels, same ADC-vs-Voltage formatting
-    /// (`format_dssd_value`) - so the exported file always matches what's
-    /// currently on screen.
+    /// Export the data table as csv
     fn export_table_csv(&mut self) {
         if self.events.is_empty() {
             self.status_message = "No events to export - run Analyze Files first.".to_string();
@@ -768,20 +770,29 @@ impl ObservationMode {
         let mut csv = String::from(
             "Packet Sync Code (Byte 0-1),Package ID (Byte 2-3),Packet Seq (Byte 4-5),Packet Data Len (Byte 6-7),Time (Byte 8-13),Data Type (Byte 14-15)",
         );
+        csv.push_str(&format!(",Particle Time {}", particle_byte_label("0-1")));
         if show_dssd {
             for layer in DSSD_TABLE_LAYERS {
-                let (x_range, y_range) = dssd_byte_range(layer);
+                let (pos_range, x_range, y_range) = dssd_byte_ranges(layer);
                 csv.push_str(&format!(
-                    ",{layer:?}X (Byte {x_range}),{layer:?}Y (Byte {y_range})"
+                    ",{layer:?} XY Position {},{layer:?} X Pulse Height {},{layer:?} Y Pulse Height {}",
+                    particle_byte_label(pos_range),
+                    particle_byte_label(x_range),
+                    particle_byte_label(y_range)
                 ));
             }
         } else {
             for layer in BGO_TABLE_LAYERS {
-                let (h_range, l_range) = bgo_byte_range(layer);
+                let (h_range, l_range) = bgo_byte_ranges(layer);
                 csv.push_str(&format!(
-                    ",{layer:?}H (Byte {h_range}),{layer:?}L (Byte {l_range})"
+                    ",{layer:?} High-Gain Pulse Height {},{layer:?} Low-Gain Pulse Height {}",
+                    particle_byte_label(h_range),
+                    particle_byte_label(l_range)
                 ));
             }
+        }
+        for field in LINE_TAIL_FIELDS {
+            csv.push_str(&format!(",{}", line_extra_header(field)));
         }
         csv.push('\n');
 
@@ -795,10 +806,12 @@ impl ObservationMode {
                 format_event_time(event.time),
                 event.data_type
             ));
+            csv.push_str(&format!(",{}", event.particle_time_raw));
             if show_dssd {
-                for (x, y) in event.dssd {
+                for (pos, (x, y)) in event.dssd_position.into_iter().zip(event.dssd) {
                     csv.push_str(&format!(
-                        ",{},{}",
+                        ",{},{},{}",
+                        pos,
                         self.format_dssd_value(x),
                         self.format_dssd_value(y)
                     ));
@@ -807,6 +820,9 @@ impl ObservationMode {
                 for (h, l) in event.bgo {
                     csv.push_str(&format!(",{h},{l}"));
                 }
+            }
+            for value in event.line_extra.iter() {
+                csv.push_str(&format!(",{value}"));
             }
             csv.push('\n');
         }
@@ -828,34 +844,21 @@ impl ObservationMode {
         ui: &mut egui::Ui,
         key: &str,
         id: &str,
+        header_rect: Option<egui::Rect>,
         x_range: Option<(f64, f64)>,
         export: &mut crate::plot_export::PlotExportQueue,
     ) {
-        self.histogram_plot_sized(ui, key, id, 260.0, x_range, export);
+        self.histogram_plot_sized(ui, key, id, 260.0, header_rect, x_range, export);
     }
 
-    /// Bar-chart rendering (one bar per raw ADC channel, matching the
-    /// original's `AddBar(hist, binMidpoints)`) at a configurable height,
-    /// with any enabled Gaussian/Lorentzian/HEMG fits overlaid as line
-    /// curves on top (mirrors the `PlotStripHistogram`/`PlotBGOHistogram`
-    /// bar+fit rendering). `x_range`, when set (see `dssd_x_range`),
-    /// restricts both the bars and the fit curve to `[min, max]` by leaving
-    /// out-of-range points out of what's drawn, so the plot's auto-bounds
-    /// settle on that Fit/View ROI. Zero-count channels are skipped: they
-    /// draw nothing anyway, and real data only ever populates a narrow
-    /// window of the 16384-channel range, so this keeps the draw count small
-    /// without changing what's visible.
-    ///
-    /// A stats line (Peak/Counts/Mean/RMS/FWHM/Res, see
-    /// `format_histogram_stats`) is drawn below every plot this way. Both
-    /// the fit (see `compute_fits`) and this stats line use the same
-    /// `x_range` as the view.
+    /// Bar-chart rendering (Counting the number of events in each ADC channel)
     fn histogram_plot_sized(
         &mut self,
         ui: &mut egui::Ui,
         key: &str,
         id: &str,
         height: f32,
+        header_rect: Option<egui::Rect>,
         x_range: Option<(f64, f64)>,
         export: &mut crate::plot_export::PlotExportQueue,
     ) {
@@ -875,8 +878,12 @@ impl ObservationMode {
         };
         let show_channel = |x: f64| adaptive_threshold.is_none_or(|threshold| x.abs() > threshold);
 
-        let plot = Plot::new(id).height(height).legend(Legend::default());
-        crate::plot_export::show(ui, export, id, id, plot, |plot_ui| {
+        let plot = Plot::new(id)
+            .height(height)
+            .legend(Legend::default())
+            .custom_x_axes(vec![crate::plot_export::x_axis("Pulse Height (ADC Channel)")])
+            .custom_y_axes(vec![crate::plot_export::y_axis("Counts")]);
+        crate::plot_export::show(ui, export, id, id, height, header_rect, plot, |plot_ui| {
             if let Some(hist) = hist {
                 let bars: Vec<Bar> = hist
                     .iter()
@@ -940,10 +947,11 @@ impl ObservationMode {
         ui: &mut egui::Ui,
         key: &str,
         id: &str,
+        header_rect: Option<egui::Rect>,
         x_range: Option<(f64, f64)>,
         export: &mut crate::plot_export::PlotExportQueue,
     ) {
-        self.histogram_plot_sized(ui, key, id, 180.0, x_range, export);
+        self.histogram_plot_sized(ui, key, id, 180.0, header_rect, x_range, export);
     }
 
     fn ensure_fits(&mut self, key: &str, x_range: Option<(f64, f64)>) {
@@ -1666,8 +1674,11 @@ fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>, run_id: u64)
                     packet_data_length: r.packet_data_length,
                     time: r.time,
                     data_type: r.data_type,
+                    particle_time_raw: r.particle_time_raw,
+                    dssd_position: r.dssd_positions,
                     dssd: r.dssd_pulses,
                     bgo: r.bgo_pulses,
+                    line_extra: r.line_tail,
                 })
                 .collect();
             let _ = tx.send(WorkerMsg::Complete {

@@ -1,17 +1,5 @@
-//! Pure business logic extracted from the Baseline mode ViewModels
-//! (`MainViewModel.cs` + `.Processing.cs` + `.FileOperations.cs`). UI/plot
-//! rendering and Dispatcher-marshaled progress reporting are not part of
-//! this port; that lives in the egui app layer, which calls these functions
-//! from worker threads.
-//!
-//! `MainViewModel.cs`'s own `BuildHistogram` helper (using
-//! `(edges[i]+edges[i+1])/2` for bin centers) is dead code - grep confirms
-//! no call site - so it is *not* replicated. The actually-exercised path is
-//! the inline histogram logic in `ProcessData`/`ProcessCalibration`'s ROI
-//! sibling, which computes bin centers as `edge + 0.5` (an approximation
-//! that only equals the true center when bin width is ~1, true for the
-//! default ADC config of 16384 bins over a ~16384-wide range). That exact
-//! formula is what's transcribed in [`build_histogram`] below.
+//! Build Histogram and compute mean for one detector layer (16 channels),
+//! UI /plot rendering and Dispatcher-marshaled progress reporting are not part of
 
 use crate::models::baseline::BaselineData;
 use rayon::prelude::*;
@@ -53,9 +41,7 @@ pub fn apply_thresholding(
         .collect()
 }
 
-/// Matches the inline histogram + bin-center logic in `ProcessData`
-/// (see module docs for why `edge + 0.5`, not the true bin center, is used).
-/// `x_axis_is_voltage` mirrors `SelectedXAxisIndex == 1`.
+/// ProcessData, build Histogram, and compute mean for one detector layer (16 channels)
 pub fn build_histogram(
     filtered_data: &[f64],
     h_min: f64,
@@ -95,10 +81,7 @@ pub fn build_histogram_avg_centers(
     (counts, bin_centers)
 }
 
-/// Best-effort transcription of `ScottPlot.Statistics.Common.Histogram`:
-/// fixed-width bins spanning `[min, max]`; values outside the range are not
-/// counted (ScottPlot's exact out-of-range behavior could not be inspected
-/// from source in this port and should be re-verified against real data).
+/// HistogramCommon: fixed-width bins spanning `[min, max]`; values outside the range are not counted
 fn histogram_common(data: &[f64], min: f64, max: f64, bin_count: usize) -> (Vec<f64>, Vec<f64>) {
     let mut counts = vec![0.0; bin_count];
     let mut edges = vec![0.0; bin_count + 1];
@@ -210,15 +193,14 @@ pub fn get_daily_output_directory(
     Ok(full_path)
 }
 
-/// Matches `WriteMeansToFile`: one `"F2"`-formatted value per line.
+/// WriteMeansToFile: one `"F2"`-formatted value per line.
 pub fn write_means_to_file(dir: &Path, layer_id: u32, means: &[f64; 16]) -> std::io::Result<()> {
     let lines: Vec<String> = means.iter().map(|m| format!("{m:.2}")).collect();
     let path = dir.join(format!("MeanValues{layer_id}.txt"));
     fs::write(path, lines.join("\n"))
 }
 
-/// Matches `LoadMeanFromFile`. `layer_id` is 1/2/6/7 (matches file naming);
-/// returns 0.0 on any failure, mirroring the original's swallowed `catch {}`.
+/// LoadMeanFromFile: reads a mean value from a file.
 pub fn load_mean_from_file(dir: &Path, layer_id: u32, channel_index: usize) -> f64 {
     let path = dir.join(format!("MeanValues{layer_id}.txt"));
     let Ok(content) = fs::read_to_string(path) else {

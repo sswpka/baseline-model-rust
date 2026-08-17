@@ -1,12 +1,4 @@
-//! Direct transcription of `Infrastructure/Services/Observation/DataProcessor.cs`
-//! (`ObservationDataProcessor`).
-//!
-//! The C# stored each particle's decoded fields in a loosely-typed
-//! `Dictionary<string, object>` (kept, per its own comments, "for legacy
-//! UI binding"); since there is no WPF binding to replicate here, that is
-//! represented as the typed [`ParticleResult`] instead. `StorageDataList`
-//! and `AllResults` held the exact same objects in the same order in the
-//! original, so they're collapsed into the single `results` field.
+//! Data Processing for Observation Mode
 
 use crate::math::KalmanFilter;
 use crate::models::observation::{BgoData, BgoLayer, DetectorLayer, LayerData};
@@ -15,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 const HEADER_OFFSET: usize = 16;
 const PARTICLE_DATA_LENGTH: usize = 34;
@@ -25,17 +18,133 @@ const BGO_HISTOGRAM_SIZE: usize = 4096;
 const MODERN_PACKET_LENGTH: u16 = 0x00F7;
 const LEGACY_PACKET_LENGTH: u16 = 0x002D;
 
+/// Contruct a line's tail fields
+pub struct LineTailField {
+    pub label: &'static str,
+    pub byte_start: usize,
+    pub byte_len: usize,
+    pub is_hex: bool,
+}
+
+const fn dec(label: &'static str, byte_start: usize, byte_len: usize) -> LineTailField {
+    LineTailField { label, byte_start, byte_len, is_hex: false }
+}
+
+pub const LINE_TAIL_FIELDS: &[LineTailField] = &[
+    dec("Galactic Electron Count", 186, 1),
+    dec("Albedo Electron Count", 187, 1),
+    dec("Galactic Ion Count", 188, 1),
+    dec("Albedo Ion Count", 189, 1),
+    dec("L1 Ion Threshold", 190, 2),
+    dec("L1 Electron Threshold", 192, 2),
+    dec("L2 Ion Particle", 194, 2),
+    dec("L2 Electron Particle", 196, 2),
+    dec("L3 Ion Particle", 198, 2),
+    dec("L3 Electron Particle", 200, 2),
+    dec("L4 Ion Particle", 202, 2),
+    dec("L4 Electron Particle", 204, 2),
+    dec("L5 Ion Particle", 206, 2),
+    dec("L5 Electron Particle", 208, 2),
+    dec("L6 Ion Particle", 210, 2),
+    dec("L6 Electron Particle", 212, 2),
+    dec("L7 Ion Particle", 214, 2),
+    dec("L7 Electron Particle", 216, 2),
+    dec("DSSD1 Temperature", 218, 2),
+    dec("FEE1 Current", 220, 2),
+    dec("FEE1 Temperature", 222, 2),
+    dec("DSSD7 Temperature", 224, 2),
+    dec("FEE2 Current", 226, 2),
+    dec("FEE2 Temperature", 228, 2),
+    dec("FEE1 Threshold", 230, 2),
+    dec("FEE2 Threshold", 232, 2),
+    dec("BGO1 Bias Voltage", 234, 2),
+    dec("BGO2 Bias Voltage", 236, 2),
+    dec("BGO3 Bias Voltage", 238, 2),
+    dec("BGO2 Temperature", 240, 2),
+    LineTailField { label: "Padding", byte_start: 242, byte_len: 12, is_hex: true },
+    LineTailField { label: "Checksum", byte_start: 254, byte_len: 2, is_hex: true },
+];
+
+/// Formular decode for FEE2 Temperature and the BGO bias/temperature fields.
+fn formula_decode(x: f64) -> f64 {
+    65.17 * (x * 4096.0 / 3.3).powf(0.1401) - 141.6
+}
+
+/// Fields whose raw decoded value must be run through `formula_decode`.
+/// BGO bias-voltage/temperature fields additionally get scaled by 0.01.
+fn calibrated_value(label: &str, raw: f64) -> Option<f64> {
+    match label {
+        "FEE2 Temperature" => Some(formula_decode(raw)),
+        "BGO1 Bias Voltage" | "BGO2 Bias Voltage" | "BGO3 Bias Voltage" | "BGO2 Temperature" => {
+            Some(formula_decode(raw) * 0.01)
+        }
+        _ => None,
+    }
+}
+
+/// Decoding LINE_TAIL_FIELDS
+fn parse_line_tail_fields(hex_data: &[String]) -> Vec<String> {
+    let byte = |i: usize| -> i32 { hex_data.get(i).and_then(|h| i32::from_str_radix(h, 16).ok()).unwrap_or(0) };
+    LINE_TAIL_FIELDS
+        .iter()
+        .map(|f| {
+            if f.is_hex {
+                (f.byte_start..f.byte_start + f.byte_len).map(|i| hex_data.get(i).cloned().unwrap_or_else(|| "00".to_string())).collect()
+            } else if f.byte_len == 1 {
+                let raw = byte(f.byte_start);
+                match calibrated_value(f.label, raw as f64) {
+                    Some(value) => format!("{value:.4}"),
+                    None => raw.to_string(),
+                }
+            } else {
+                let raw = (byte(f.byte_start) << 8) + byte(f.byte_start + 1);
+                match calibrated_value(f.label, raw as f64) {
+                    Some(value) => format!("{value:.4}"),
+                    None => raw.to_string(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_line_tail_fields_from_bytes(frame: &[u8]) -> Arc<[String]> {
+    let byte = |index: usize| frame.get(index).copied().unwrap_or_default() as i32;
+    let values = LINE_TAIL_FIELDS
+        .iter()
+        .map(|field| {
+            if field.is_hex {
+                (field.byte_start..field.byte_start + field.byte_len)
+                    .map(|index| format!("{:02X}", byte(index)))
+                    .collect::<String>()
+            } else if field.byte_len == 1 {
+                let raw = byte(field.byte_start);
+                match calibrated_value(field.label, raw as f64) {
+                    Some(value) => format!("{value:.4}"),
+                    None => raw.to_string(),
+                }
+            } else {
+                let raw = (byte(field.byte_start) << 8) + byte(field.byte_start + 1);
+                match calibrated_value(field.label, raw as f64) {
+                    Some(value) => format!("{value:.4}"),
+                    None => raw.to_string(),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::from(values)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParticleResult {
     pub particle_number: i32,
+    /// Raw decoded decimal value of the Particle Time field (Byte 0-1).
+    pub particle_time_raw: i32,
     pub milliseconds: i32,
-    /// The event's absolute time: the containing line's timecode (decoded
-    /// via `get_date_time_from_hex_data`) plus this particle's own
-    /// `milliseconds` offset - every particle on the same line shares the
-    /// line's timecode but gets a distinct sub-second offset from it.
     pub time: DateTime<Utc>,
     /// (X, Y) pulse heights in `[L1, L2, L6, L7]` order.
     pub dssd_pulses: [(i32, i32); 4],
+    /// Raw XY position bytes in `[L1, L2, L6, L7]` order.
+    pub dssd_positions: [i32; 4],
     /// (High gain, Low gain) pulse heights in `[L3, L4, L5]` order.
     pub bgo_pulses: [(i32, i32); 3],
     /// Line header fields surrounding the byte 8-13 timecode - see
@@ -50,6 +159,7 @@ pub struct ParticleResult {
     pub packet_sequence: i32,
     pub packet_data_length: i32,
     pub data_type: String,
+    pub line_tail: Arc<[String]>,
 }
 
 pub struct ObservationDataProcessor {
@@ -121,11 +231,9 @@ impl ObservationDataProcessor {
             layer.high_gain.clear();
             layer.low_gain.clear();
         }
-        // Kalman filters are not reset here, matching the C# original.
     }
 
     /// Processes multiple files, returning per-layer X/Y pulse-height
-    /// histograms keyed `"DSSD{layer}_X"` / `"DSSD{layer}_Y"`.
     pub fn process_files(&mut self, file_paths: &[impl AsRef<Path>]) -> Result<HashMap<String, Vec<i32>>, String> {
         self.process_files_with_progress(file_paths, |_, _| {})
     }
@@ -199,6 +307,7 @@ impl ObservationDataProcessor {
                 offset += 1;
                 continue;
             };
+            let line_tail = parse_line_tail_fields_from_bytes(&frame);
             let particles = (0..PARTICLES_PER_LINE)
                 .map(|index| {
                     let start = HEADER_OFFSET + PARTICLE_DATA_LENGTH * index;
@@ -214,7 +323,7 @@ impl ObservationDataProcessor {
             let mut decoded = Vec::with_capacity(PARTICLES_PER_LINE);
             let mut valid = true;
             for (index, particle) in particles.iter().enumerate() {
-                match self.process_particle_bytes(particle, index, line_time, &header) {
+                match self.process_particle_bytes(particle, index, line_time, &header, &line_tail) {
                     Ok(result) => decoded.push(result),
                     Err(_) => {
                         valid = false;
@@ -334,6 +443,7 @@ impl ObservationDataProcessor {
     }
 
     pub fn process_particles(&mut self, hex_data: &[String], line_time: DateTime<Utc>, header: &LineHeaderFields) {
+        let line_tail: Arc<[String]> = Arc::from(parse_line_tail_fields(hex_data));
         for i in 0..PARTICLES_PER_LINE {
             let start = HEADER_OFFSET + PARTICLE_DATA_LENGTH * i;
             if start >= hex_data.len() {
@@ -345,13 +455,24 @@ impl ObservationDataProcessor {
                 break;
             }
 
-            if let Ok(processed) = self.process_particle_data(particle_data, i, line_time, header) {
+            if let Ok(processed) = self.process_particle_data_with_tail(particle_data, i, line_time, header, &line_tail) {
                 self.results.push(processed);
             }
         }
     }
 
     pub fn process_particle_data(&mut self, particle_data: &[String], i: usize, line_time: DateTime<Utc>, header: &LineHeaderFields) -> Result<ParticleResult, String> {
+        self.process_particle_data_with_tail(particle_data, i, line_time, header, &Arc::from(Vec::<String>::new()))
+    }
+
+    fn process_particle_data_with_tail(
+        &mut self,
+        particle_data: &[String],
+        i: usize,
+        line_time: DateTime<Utc>,
+        header: &LineHeaderFields,
+        line_tail: &Arc<[String]>,
+    ) -> Result<ParticleResult, String> {
         if particle_data.len() != PARTICLE_DATA_LENGTH {
             return Err("Particle data must contain exactly 34 bytes".to_string());
         }
@@ -359,17 +480,25 @@ impl ObservationDataProcessor {
         for (index, hex) in particle_data.iter().enumerate() {
             particle_data_bytes[index] = u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
         }
-        self.process_particle_bytes(&particle_data_bytes, i, line_time, header)
+        self.process_particle_bytes(&particle_data_bytes, i, line_time, header, line_tail)
     }
 
-    fn process_particle_bytes(&mut self, particle_data: &[u8], i: usize, line_time: DateTime<Utc>, header: &LineHeaderFields) -> Result<ParticleResult, String> {
+    fn process_particle_bytes(
+        &mut self,
+        particle_data: &[u8],
+        i: usize,
+        line_time: DateTime<Utc>,
+        header: &LineHeaderFields,
+        line_tail: &Arc<[String]>,
+    ) -> Result<ParticleResult, String> {
         if particle_data.len() != PARTICLE_DATA_LENGTH {
             return Err("Particle data must contain exactly 34 bytes".to_string());
         }
         if !valid_detector_nibbles(particle_data) {
             return Err("Invalid detector nibble".to_string());
         }
-        let milliseconds = (((particle_data[0] as i32) << 8) + particle_data[1] as i32) / 1000;
+        let particle_time_raw = ((particle_data[0] as i32) << 8) + particle_data[1] as i32;
+        let milliseconds = particle_time_raw / 1000;
         let time = line_time + chrono::Duration::milliseconds(milliseconds as i64);
 
         // --- DSSD layers ---
@@ -382,6 +511,12 @@ impl ObservationDataProcessor {
             self.process_dssd_layer(particle_data, DetectorLayer::L2, 7, 8, 10),
             self.process_dssd_layer(particle_data, DetectorLayer::L6, 24, 25, 27),
             self.process_dssd_layer(particle_data, DetectorLayer::L7, 29, 30, 32),
+        ];
+        let dssd_positions = [
+            particle_data[2] as i32,
+            particle_data[7] as i32,
+            particle_data[24] as i32,
+            particle_data[29] as i32,
         ];
 
         // --- BGO layers ---
@@ -396,15 +531,18 @@ impl ObservationDataProcessor {
 
         Ok(ParticleResult {
             particle_number: i as i32 + 1,
+            particle_time_raw,
             milliseconds,
             time,
             dssd_pulses,
+            dssd_positions,
             bgo_pulses,
             packet_sync: header.packet_sync.clone(),
             package_id: header.package_id,
             packet_sequence: header.packet_sequence,
             packet_data_length: header.packet_data_length,
             data_type: header.data_type.clone(),
+            line_tail: Arc::clone(line_tail),
         })
     }
 
@@ -504,9 +642,6 @@ fn histogram_of_i32(values: &[i32], size: usize) -> Vec<i32> {
     hist
 }
 
-/// The instrument's own timecode base: the 6-byte timecode this function
-/// decodes (4-byte seconds + 2-byte milliseconds) counts up from this
-/// moment, not from the Unix epoch.
 fn observation_epoch() -> DateTime<Utc> {
     DateTime::from_naive_utc_and_offset(NaiveDate::from_ymd_opt(2024, 10, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(), Utc)
 }
@@ -527,10 +662,7 @@ pub fn get_date_time_from_hex_data(hex_data: &[String]) -> Result<DateTime<Utc>,
     Ok(observation_epoch() + chrono::Duration::seconds(seconds_part as i64) + chrono::Duration::milliseconds(milliseconds_part as i64))
 }
 
-/// The line-header fields surrounding the byte 8-13 timecode - see
-/// `parse_line_header_fields`. `packet_sync`/`data_type` stay raw hex (e.g.
-/// `"E225"`) since they're a fixed marker and a type code, not measurements;
-/// the rest decode to decimal like the rest of the payload.
+/// The line-header fields
 #[derive(Debug, Clone, Default)]
 pub struct LineHeaderFields {
     pub packet_sync: String,
@@ -540,13 +672,8 @@ pub struct LineHeaderFields {
     pub data_type: String,
 }
 
-/// Decodes the line-header fields around the timecode: Packet Sync Code
-/// (bytes 0-1, raw hex), Package ID (2-3, decimal), Packet Sequence (4-5,
-/// decimal), Packet Data Length (6-7, decimal), the byte 8-13 timecode
-/// itself (`get_date_time_from_hex_data`, decoded separately), then Data
-/// Type (14-15, raw hex) - mirrors the identical 16-byte header layout
-/// `flux::processing::process_header_internal` decodes for its own (much
-/// larger) E225 packets.
+/// Decodes the line-header fields around the timecode: Packet Sync Code, Package ID, Packet Sequence,
+/// Packet Data Lengtgh, and Data Type
 pub fn parse_line_header_fields(hex_data: &[String]) -> Option<LineHeaderFields> {
     if hex_data.len() < 16 {
         return None;
@@ -756,11 +883,18 @@ mod tests {
     fn process_files_keeps_first_packet_and_file_order() {
         let first_path = temp_path("order_a");
         let second_path = temp_path("order_b");
-        let first = [
+        let mut first = [
             packet_frame(1, MODERN_PACKET_LENGTH, 0x00AD, None),
             packet_frame(2, LEGACY_PACKET_LENGTH, 0x00AD, None),
         ]
         .concat();
+        first[16] = 0x03;
+        first[17] = 0xE8;
+        first[186] = 0x2A;
+        first[242] = 0xAB;
+        first[243] = 0xCD;
+        first[254] = 0x12;
+        first[255] = 0x34;
         let second = packet_frame(3, MODERN_PACKET_LENGTH, 0x00AD, None);
         fs::write(&first_path, format!("{}\n", hex_text(&first))).unwrap();
         fs::write(&second_path, nibble_spaced_hex_text(&second)).unwrap();
@@ -788,6 +922,17 @@ mod tests {
             processor.results[0].bgo_pulses,
             [(4095, 100), (300, 100), (500, 100)]
         );
+        assert_eq!(processor.results[0].particle_time_raw, 1000);
+        assert_eq!(processor.results[0].milliseconds, 1);
+        assert_eq!(processor.results[0].dssd_positions, [0x11, 0x11, 0x11, 0x11]);
+        assert_eq!(processor.results[0].line_tail[0], "42");
+        assert_eq!(processor.results[0].line_tail[30], "ABCD00000000000000000000");
+        assert_eq!(processor.results[0].line_tail[31], "1234");
+        assert!(processor
+            .results
+            .iter()
+            .take(PARTICLES_PER_LINE)
+            .all(|result| std::sync::Arc::ptr_eq(&result.line_tail, &processor.results[0].line_tail)));
     }
 
     #[test]

@@ -1,19 +1,5 @@
-//! Port of Baseline mode: `MainViewModel` (+ `.FileOperations.cs` +
-//! `.Processing.cs`) and its `MainWindow`. CommunityToolkit MVVM's
-//! `[ObservableProperty]`/`[RelayCommand]` plumbing is collapsed into a
-//! plain state struct + methods called directly from `update()`, per the
-//! project's porting approach (immediate-mode UI has no use for
-//! `INotifyPropertyChanged`).
-//!
-//! Long-running work (file I/O, Excel, per-channel fits) runs on a
-//! background thread and reports back over an `mpsc` channel, standing in
-//! for the C#'s `Task.Run` + `Dispatcher.Invoke` pattern.
-//!
-//! Deferred (not in this pass - see project notes): manual-fit mode with
-//! parameter locks and `OptimizeManual`, the data-table/paging grid, the
-//! coincidence-matrix heatmap window, and `UseKalmanFilter` (present as a
-//! field but not exercised by any ported pipeline - grep confirms it's not
-//! read anywhere in `MainViewModel.Processing.cs`).
+//! Port of Baseline mode: Running file I/O, Excel, per-channel fits runs on a
+//! background thread and reports back over an `mpsc` channel
 
 use baseline_core::io;
 use baseline_core::math::MathService;
@@ -243,7 +229,7 @@ impl BaselineMode {
         }
     }
 
-    /// Column 1: file open/export/header-check, plus the pre-process/process/
+    /// File open/export/header-check, plus the pre-process/process/
     /// stop/reset action buttons.
     fn file_and_actions_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("File & Actions");
@@ -409,7 +395,7 @@ impl BaselineMode {
         }
     }
 
-    /// Column 3: standalone tools (coincidence-matrix heatmap, save mean).
+    /// Standalone tools (coincidence-matrix heatmap, save mean).
     fn tools_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("Tools");
 
@@ -428,7 +414,7 @@ impl BaselineMode {
         }
     }
 
-    /// Column 4: DSSD layer selection, X-axis range, and the X-axis view mode.
+    /// DSSD layer selection, X-axis range, and the X-axis view mode.
     fn dssd_range_view_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("DSSD / Range / View");
 
@@ -474,7 +460,7 @@ impl BaselineMode {
         );
     }
 
-    // ---- Commands (mirroring [RelayCommand] methods) ----
+    // Commands functions
 
     fn reset(&mut self) {
         self.selected_files.clear();
@@ -573,18 +559,7 @@ impl BaselineMode {
         std::thread::spawn(move || process_data_worker(output_dir, output_file_name, config, tx));
     }
 
-    /// Re-solves the fit curves for every channel that already has a
-    /// histogram, without re-reading the Excel file or redoing the
-    /// mean-subtraction/thresholding pipeline (unlike `process_data`, which
-    /// this reuses `bin_centers`/`counts` in place of). Triggered whenever a
-    /// fit checkbox changes, so ticking e.g. "Lorentzian" after Process Data
-    /// has already run actually shows the curve instead of doing nothing
-    /// until the next full reprocess.
     fn recompute_fits(&mut self) {
-        // Don't let a checkbox toggle race an in-flight Process Data (or a
-        // prior recompute): both send `Busy(false)` on completion, so
-        // whichever finishes first would clear the busy flag while the
-        // other is still overwriting channels out from under it.
         if self.is_busy {
             return;
         }
@@ -645,10 +620,7 @@ impl BaselineMode {
     }
 }
 
-// ---------------------------------------------------------------------
 // Background workers
-// ---------------------------------------------------------------------
-
 struct ProcessConfig {
     layer_index: usize,
     x_axis_is_voltage: bool,

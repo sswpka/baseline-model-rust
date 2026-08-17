@@ -198,16 +198,20 @@ impl FluxMode {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for layer in &self.layers {
-                    ui.label(format!("{} - {}", layer.name, layer.stats_text));
+                    let header = ui.label(format!("{} - {}", layer.name, layer.stats_text));
                     let id_source = format!("flux_plot_{}", layer.name);
                     let plot = Plot::new(id_source.clone())
                         .height(180.0)
-                        .legend(Legend::default());
+                        .legend(Legend::default())
+                        .custom_x_axes(vec![crate::plot_export::x_axis("Time (s)")])
+                        .custom_y_axes(vec![crate::plot_export::y_axis("Flux (particles/m\u{00b2}/s)")]);
                     crate::plot_export::show(
                         ui,
                         export,
                         &id_source,
                         &layer.name,
+                        180.0,
+                        Some(header.rect),
                         plot,
                         |plot_ui| {
                             if !layer.x_data.is_empty() {

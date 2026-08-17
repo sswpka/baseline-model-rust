@@ -28,7 +28,11 @@ pub fn calculate_mean(data: &[f64]) -> f64 {
 /// Matches `ApplyThresholding`: keeps only samples whose deviation from the
 /// mean exceeds `k_factor * sigma`. No-op (returns input unchanged) when
 /// `use_thresholding` is false.
-pub fn apply_thresholding(centered_data: &[f64], k_factor: f64, use_thresholding: bool) -> Vec<f64> {
+pub fn apply_thresholding(
+    centered_data: &[f64],
+    k_factor: f64,
+    use_thresholding: bool,
+) -> Vec<f64> {
     if !use_thresholding {
         return centered_data.to_vec();
     }
@@ -42,7 +46,11 @@ pub fn apply_thresholding(centered_data: &[f64], k_factor: f64, use_thresholding
     let sigma = (sum_squares / length as f64).sqrt();
     let threshold = k_factor * sigma;
 
-    centered_data.iter().copied().filter(|&v| (v - mean).abs() > threshold).collect()
+    centered_data
+        .iter()
+        .copied()
+        .filter(|&v| (v - mean).abs() > threshold)
+        .collect()
 }
 
 /// Matches the inline histogram + bin-center logic in `ProcessData`
@@ -60,7 +68,11 @@ pub fn build_histogram(
     let mut bin_centers = vec![0.0; bin_edges.len() - 1];
     for k in 0..bin_centers.len() {
         let center = bin_edges[k] + 0.5;
-        bin_centers[k] = if x_axis_is_voltage { (center / 16384.0) * 5.0 * 1000.0 } else { center };
+        bin_centers[k] = if x_axis_is_voltage {
+            (center / 16384.0) * 5.0 * 1000.0
+        } else {
+            center
+        };
     }
 
     (counts, bin_centers)
@@ -69,7 +81,12 @@ pub fn build_histogram(
 /// Matches `CalibrationViewModel.UpdatePlots`'s histogram (true average bin
 /// centers, unlike [`build_histogram`]'s `edge + 0.5` approximation - the two
 /// modes' C# actually use different formulas, transcribed as-is).
-pub fn build_histogram_avg_centers(filtered_data: &[f64], min: f64, max: f64, bin_count: usize) -> (Vec<f64>, Vec<f64>) {
+pub fn build_histogram_avg_centers(
+    filtered_data: &[f64],
+    min: f64,
+    max: f64,
+    bin_count: usize,
+) -> (Vec<f64>, Vec<f64>) {
     let (counts, bin_edges) = histogram_common(filtered_data, min, max, bin_count);
     let mut bin_centers = vec![0.0; bin_edges.len() - 1];
     for k in 0..bin_centers.len() {
@@ -86,9 +103,9 @@ fn histogram_common(data: &[f64], min: f64, max: f64, bin_count: usize) -> (Vec<
     let mut counts = vec![0.0; bin_count];
     let mut edges = vec![0.0; bin_count + 1];
     let bin_width = (max - min) / bin_count as f64;
-    for i in 0..=bin_count {
+    (0..=bin_count).for_each(|i| {
         edges[i] = min + i as f64 * bin_width;
-    }
+    });
 
     if bin_width > 0.0 {
         for &v in data {
@@ -110,7 +127,10 @@ fn histogram_common(data: &[f64], min: f64, max: f64, bin_count: usize) -> (Vec<
 }
 
 /// Matches `CalculateCoincidenceMatrix`: rows/cols indexed \[Z\]\[X\], each 0-7.
-pub fn calculate_coincidence_matrix(data: &[BaselineData], layer_selector: impl Fn(&BaselineData) -> [f32; 16]) -> [[f64; 8]; 8] {
+pub fn calculate_coincidence_matrix(
+    data: &[BaselineData],
+    layer_selector: impl Fn(&BaselineData) -> [f32; 16],
+) -> [[f64; 8]; 8] {
     let mut matrix = [[0.0f64; 8]; 8];
 
     for item in data {
@@ -118,12 +138,12 @@ pub fn calculate_coincidence_matrix(data: &[BaselineData], layer_selector: impl 
 
         let mut max_x = 0usize;
         let mut max_val_x = values[0];
-        for x in 1..8 {
+        (1..8).for_each(|x| {
             if values[x] > max_val_x {
                 max_val_x = values[x];
                 max_x = x;
             }
-        }
+        });
 
         let mut max_z = 0usize;
         let mut max_val_z = values[8];
@@ -142,7 +162,10 @@ pub fn calculate_coincidence_matrix(data: &[BaselineData], layer_selector: impl 
 
 /// Matches `CalculateMeanParallel`: per-channel (16) mean across all events
 /// for one detector layer.
-pub fn calculate_mean_parallel(data: &[BaselineData], layer_selector: impl Fn(&BaselineData) -> [f32; 16] + Sync) -> [f64; 16] {
+pub fn calculate_mean_parallel(
+    data: &[BaselineData],
+    layer_selector: impl Fn(&BaselineData) -> [f32; 16] + Sync,
+) -> [f64; 16] {
     let count = data.len();
     if count == 0 {
         return [0.0; 16];
@@ -169,14 +192,17 @@ pub fn calculate_mean_parallel(data: &[BaselineData], layer_selector: impl Fn(&B
         );
 
     let mut means = sums;
-    for ch in 0..16 {
+    (0..16).for_each(|ch| {
         means[ch] /= count as f64;
-    }
+    });
     means
 }
 
 /// Matches `GetDailyOutputDirectory`: `{base}/{yyyy-MM-dd}`, created if missing.
-pub fn get_daily_output_directory(base: &Path, today: chrono::NaiveDate) -> std::io::Result<PathBuf> {
+pub fn get_daily_output_directory(
+    base: &Path,
+    today: chrono::NaiveDate,
+) -> std::io::Result<PathBuf> {
     let full_path = base.join(today.format("%Y-%m-%d").to_string());
     if !full_path.exists() {
         fs::create_dir_all(&full_path)?;
@@ -204,4 +230,3 @@ pub fn load_mean_from_file(dir: &Path, layer_id: u32, channel_index: usize) -> f
         .and_then(|l| l.trim().parse::<f64>().ok())
         .unwrap_or(0.0)
 }
-

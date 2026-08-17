@@ -13,6 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use crate::channel::{channel_block_ui, ChannelState};
 use crate::fit_overlay::{self, FitOverlayFlags};
 
+#[derive()]
 enum WorkerMsg {
     Status(String, Color32),
     Busy(bool),
@@ -28,7 +29,7 @@ pub struct CalibrationMode {
     output_file_name: String,
     read_multiple_files: bool,
 
-    selected_layer_index: usize, // 0=L1,1=L2,2=L6,3=L7
+    selected_layer_index: usize,  // 0=L1,1=L2,2=L6,3=L7
     selected_x_axis_index: usize, // 0=ADC,1=Voltage
     x_axis_min: f64,
     x_axis_max: f64,
@@ -58,8 +59,17 @@ impl Default for CalibrationMode {
         let (tx, rx) = std::sync::mpsc::channel();
         let channels = (0..16)
             .map(|i| {
-                let name = if i < 8 { format!("X{}", i + 1) } else { format!("Z{}", i - 7) };
-                ChannelState { channel_index: i, title: name, stats_text: String::new(), ..Default::default() }
+                let name = if i < 8 {
+                    format!("X{}", i + 1)
+                } else {
+                    format!("Z{}", i - 7)
+                };
+                ChannelState {
+                    channel_index: i,
+                    title: name,
+                    stats_text: String::new(),
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -92,7 +102,11 @@ impl Default for CalibrationMode {
 }
 
 impl CalibrationMode {
-    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
+    pub fn update(
+        &mut self,
+        ctx: &egui::Context,
+        export: &mut crate::plot_export::PlotExportQueue,
+    ) {
         self.drain_messages();
 
         egui::TopBottomPanel::top("calibration_top").show(ctx, |ui| {
@@ -100,10 +114,16 @@ impl CalibrationMode {
             ui.separator();
             ui.label(&self.input_files_info);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy, egui::Button::new("Select Raw Files...")).clicked() {
+                if ui
+                    .add_enabled(!self.is_busy, egui::Button::new("Select Raw Files..."))
+                    .clicked()
+                {
                     self.select_files();
                 }
-                if ui.add_enabled(!self.is_busy, egui::Button::new("Select Excel Files...")).clicked() {
+                if ui
+                    .add_enabled(!self.is_busy, egui::Button::new("Select Excel Files..."))
+                    .clicked()
+                {
                     self.select_excel_files();
                 }
             });
@@ -114,10 +134,19 @@ impl CalibrationMode {
             });
 
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy && !self.input_files.is_empty(), egui::Button::new("Process to Excel")).clicked() {
+                if ui
+                    .add_enabled(
+                        !self.is_busy && !self.input_files.is_empty(),
+                        egui::Button::new("Process to Excel"),
+                    )
+                    .clicked()
+                {
                     self.process_data();
                 }
-                if ui.add_enabled(!self.is_busy, egui::Button::new("Read Data")).clicked() {
+                if ui
+                    .add_enabled(!self.is_busy, egui::Button::new("Read Data"))
+                    .clicked()
+                {
                     self.read_data();
                 }
                 if ui.button("Reset").clicked() {
@@ -130,7 +159,10 @@ impl CalibrationMode {
                 .selected_text(["L1", "L2", "L6", "L7"][self.selected_layer_index])
                 .show_ui(ui, |ui| {
                     for (i, name) in ["L1", "L2", "L6", "L7"].iter().enumerate() {
-                        if ui.selectable_value(&mut self.selected_layer_index, i, *name).changed() {
+                        if ui
+                            .selectable_value(&mut self.selected_layer_index, i, *name)
+                            .changed()
+                        {
                             self.update_plots(true);
                         }
                     }
@@ -187,10 +219,18 @@ impl CalibrationMode {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Fits:");
                 let mut fits_changed = false;
-                fits_changed |= ui.checkbox(&mut self.show_gaussian_fit, "Gaussian").changed();
-                fits_changed |= ui.checkbox(&mut self.show_hemg_single_fit, "HEMG single").changed();
-                fits_changed |= ui.checkbox(&mut self.show_hemg_double_fit, "HEMG double").changed();
-                fits_changed |= ui.checkbox(&mut self.show_lorentzian_fit, "Lorentzian").changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_gaussian_fit, "Gaussian")
+                    .changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_hemg_single_fit, "HEMG single")
+                    .changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_hemg_double_fit, "HEMG double")
+                    .changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_lorentzian_fit, "Lorentzian")
+                    .changed();
                 if fits_changed {
                     self.update_plots(true);
                 }
@@ -199,7 +239,9 @@ impl CalibrationMode {
             ui.separator();
             ui.colored_label(Color32::LIGHT_GRAY, &self.status_message);
             if self.is_busy {
-                ui.add(egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage());
+                ui.add(
+                    egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage(),
+                );
             }
             if !self.header_check_status.is_empty() {
                 ui.label(&self.header_check_status);
@@ -261,7 +303,10 @@ impl CalibrationMode {
     }
 
     fn select_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().add_filter("Text files", &["txt"]).pick_files() {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("Text files", &["txt"])
+            .pick_files()
+        {
             self.input_files_info = format!("{} txt file(s) selected", files.len());
             self.input_files = files;
             self.read_multiple_files = false;
@@ -270,7 +315,11 @@ impl CalibrationMode {
     }
 
     fn select_excel_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().add_filter("Excel files", &["xlsx"]).set_title("Select Excel files to read").pick_files() {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("Excel files", &["xlsx"])
+            .set_title("Select Excel files to read")
+            .pick_files()
+        {
             self.input_files_info = format!("{} Excel file(s) selected for reading", files.len());
             self.input_files = files;
             self.read_multiple_files = true;
@@ -292,10 +341,17 @@ impl CalibrationMode {
         self.progress_value = 0.0;
         self.accumulator = CalibrationAccumulator::default();
 
-        let files_to_read: Vec<PathBuf> = if self.read_multiple_files && !self.input_files.is_empty() {
+        let files_to_read: Vec<PathBuf> = if self.read_multiple_files
+            && !self.input_files.is_empty()
+        {
             self.input_files
                 .iter()
-                .filter(|f| f.extension().map(|e| e.eq_ignore_ascii_case("xlsx")).unwrap_or(false) && f.exists())
+                .filter(|f| {
+                    f.extension()
+                        .map(|e| e.eq_ignore_ascii_case("xlsx"))
+                        .unwrap_or(false)
+                        && f.exists()
+                })
                 .cloned()
                 .collect()
         } else {
@@ -341,16 +397,23 @@ impl CalibrationMode {
         };
 
         for ch in 0..16 {
-            let data_for_channel: Vec<f64> = source[ch].iter().copied().filter(|&d| d > 0.0).collect();
+            let data_for_channel: Vec<f64> =
+                source[ch].iter().copied().filter(|&d| d > 0.0).collect();
             if data_for_channel.is_empty() {
                 self.channels[ch].active_fits.clear();
                 continue;
             }
             let (counts, bin_centers) =
-                baseline_core::baseline_processing::build_histogram_avg_centers(&data_for_channel, self.x_axis_min, self.x_axis_max, 500);
+                baseline_core::baseline_processing::build_histogram_avg_centers(
+                    &data_for_channel,
+                    self.x_axis_min,
+                    self.x_axis_max,
+                    500,
+                );
 
             if recompute_fits {
-                let (stats, fits) = fit_overlay::compute_fits(&self.math, &bin_centers, &counts, &flags);
+                let (stats, fits) =
+                    fit_overlay::compute_fits(&self.math, &bin_centers, &counts, &flags);
                 self.channels[ch].mu = stats.mu;
                 self.channels[ch].sigma = stats.sigma;
                 self.channels[ch].fwhm = stats.fwhm;
@@ -378,13 +441,22 @@ impl CalibrationMode {
 }
 
 fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<WorkerMsg>) {
-    match io::segment_filter::filter_e225_segments_from_files(&files, baseline_core::models::shared::AppConstants::SEGMENT_HEX_LENGTH) {
+    match io::segment_filter::filter_e225_segments_from_files(
+        &files,
+        baseline_core::models::shared::AppConstants::SEGMENT_HEX_LENGTH,
+    ) {
         Ok(segments) if !segments.is_empty() => {
-            let _ = tx.send(WorkerMsg::Status(format!("Saving {} segments to Excel...", segments.len()), Color32::GRAY));
+            let _ = tx.send(WorkerMsg::Status(
+                format!("Saving {} segments to Excel...", segments.len()),
+                Color32::GRAY,
+            ));
             match io::file_helper::resolve_excel_save_path(&output_name, "") {
                 Ok(path) => match io::excel::save_lines_to_excel(&segments, &path) {
                     Ok(()) => {
-                        let _ = tx.send(WorkerMsg::Status("Processing complete.".to_string(), Color32::from_rgb(50, 200, 50)));
+                        let _ = tx.send(WorkerMsg::Status(
+                            "Processing complete.".to_string(),
+                            Color32::from_rgb(50, 200, 50),
+                        ));
                     }
                     Err(e) => {
                         let _ = tx.send(WorkerMsg::Error(e));
@@ -396,7 +468,10 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
             }
         }
         Ok(_) => {
-            let _ = tx.send(WorkerMsg::Status("No valid segments found.".to_string(), Color32::RED));
+            let _ = tx.send(WorkerMsg::Status(
+                "No valid segments found.".to_string(),
+                Color32::RED,
+            ));
         }
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(format!("Error: {e}")));
@@ -429,7 +504,11 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
 
             if file_index == 0 && row_index == 0 {
                 let valid = validate_header(&hex_data);
-                let _ = tx.send(WorkerMsg::HeaderCheck(if valid { "Checksum OK".to_string() } else { "Checksum Mismatch".to_string() }));
+                let _ = tx.send(WorkerMsg::HeaderCheck(if valid {
+                    "Checksum OK".to_string()
+                } else {
+                    "Checksum Mismatch".to_string()
+                }));
                 if !valid {
                     header_ok = false;
                     break;
@@ -442,7 +521,13 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
                 let progress = (row_index as f64 / total_rows.max(1) as f64) * 100.0;
                 let _ = tx.send(WorkerMsg::Progress(progress));
                 let _ = tx.send(WorkerMsg::Status(
-                    format!("File {}/{}: {}/{} rows", file_index + 1, file_count, row_index, total_rows),
+                    format!(
+                        "File {}/{}: {}/{} rows",
+                        file_index + 1,
+                        file_count,
+                        row_index,
+                        total_rows
+                    ),
                     Color32::GRAY,
                 ));
             }
@@ -454,7 +539,10 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     }
 
     if !header_ok {
-        let _ = tx.send(WorkerMsg::Status("Stopped: Checksum Mismatch".to_string(), Color32::RED));
+        let _ = tx.send(WorkerMsg::Status(
+            "Stopped: Checksum Mismatch".to_string(),
+            Color32::RED,
+        ));
         let _ = tx.send(WorkerMsg::Busy(false));
         return;
     }
@@ -464,7 +552,10 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     // on every later layer/axis change) via `update_plots`.
     let _ = tx.send(WorkerMsg::DataLoaded(accumulator));
 
-    let _ = tx.send(WorkerMsg::Status("Complete!".to_string(), Color32::from_rgb(50, 200, 50)));
+    let _ = tx.send(WorkerMsg::Status(
+        "Complete!".to_string(),
+        Color32::from_rgb(50, 200, 50),
+    ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
 }

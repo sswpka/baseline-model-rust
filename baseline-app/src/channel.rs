@@ -60,8 +60,12 @@ impl ChannelState {
                     // marker-scatter line instead. Fit curves always render as
                     // a smooth line overlay on top.
                     if self.is_log_scale {
-                        let points: PlotPoints =
-                            self.bin_centers.iter().zip(self.counts.iter()).map(|(&x, &y)| [x, y.max(0.1).log10()]).collect();
+                        let points: PlotPoints = self
+                            .bin_centers
+                            .iter()
+                            .zip(self.counts.iter())
+                            .map(|(&x, &y)| [x, y.max(0.1).log10()])
+                            .collect();
                         plot_ui.line(Line::new(points).name("Data").color(Color32::LIGHT_BLUE));
 
                         for fit in &self.active_fits {
@@ -72,7 +76,8 @@ impl ChannelState {
                                     .zip(fit.curve.iter())
                                     .map(|(&x, &y)| [x, y.max(0.1).log10()])
                                     .collect();
-                                plot_ui.line(Line::new(fit_points).name(&fit.label).color(fit.color));
+                                plot_ui
+                                    .line(Line::new(fit_points).name(&fit.label).color(fit.color));
                             }
                         }
                     } else {
@@ -80,7 +85,11 @@ impl ChannelState {
                         // so deriving width from the full span is equivalent to using adjacent
                         // centers but more robust to how exactly those centers were computed.
                         let n = self.bin_centers.len();
-                        let bar_width = if n > 1 { (self.bin_centers[n - 1] - self.bin_centers[0]) / (n - 1) as f64 } else { 1.0 };
+                        let bar_width = if n > 1 {
+                            (self.bin_centers[n - 1] - self.bin_centers[0]) / (n - 1) as f64
+                        } else {
+                            1.0
+                        };
 
                         // Baseline mode builds full 16384-bin histograms (unlike
                         // Calibration mode's 500), so both bars and any fit overlay are
@@ -100,14 +109,25 @@ impl ChannelState {
                             // fill/stroke.
                             let bars: Vec<Bar> = (first..=last)
                                 .filter(|&i| self.counts[i] > 0.0)
-                                .map(|i| Bar::new(self.bin_centers[i], self.counts[i]).width(bar_width).fill(Color32::LIGHT_BLUE).stroke(egui::Stroke::NONE))
+                                .map(|i| {
+                                    Bar::new(self.bin_centers[i], self.counts[i])
+                                        .width(bar_width)
+                                        .fill(Color32::LIGHT_BLUE)
+                                        .stroke(egui::Stroke::NONE)
+                                })
                                 .collect();
-                            plot_ui.bar_chart(BarChart::new(bars).name("Data").color(Color32::LIGHT_BLUE));
+                            plot_ui.bar_chart(
+                                BarChart::new(bars).name("Data").color(Color32::LIGHT_BLUE),
+                            );
 
                             for fit in &self.active_fits {
                                 if fit.curve.len() == self.bin_centers.len() {
-                                    let fit_points: PlotPoints = (first..=last).map(|i| [self.bin_centers[i], fit.curve[i]]).collect();
-                                    plot_ui.line(Line::new(fit_points).name(&fit.label).color(fit.color));
+                                    let fit_points: PlotPoints = (first..=last)
+                                        .map(|i| [self.bin_centers[i], fit.curve[i]])
+                                        .collect();
+                                    plot_ui.line(
+                                        Line::new(fit_points).name(&fit.label).color(fit.color),
+                                    );
                                 }
                             }
                         }
@@ -123,7 +143,12 @@ impl ChannelState {
 /// block gets the same area regardless of how much text/stats the
 /// neighboring channel happens to have. Shared by Baseline and Calibration
 /// mode, which both split their 16 channels into two 8-channel blocks.
-pub fn channel_block_ui(ui: &mut egui::Ui, heading: &str, channels: &mut [ChannelState], export: &mut PlotExportQueue) {
+pub fn channel_block_ui(
+    ui: &mut egui::Ui,
+    heading: &str,
+    channels: &mut [ChannelState],
+    export: &mut PlotExportQueue,
+) {
     ui.vertical(|ui| {
         ui.heading(heading);
         ui.separator();

@@ -20,7 +20,11 @@ pub enum WorkerMsg {
     DataLoaded(Vec<BaselineData>),
     ChannelResult(usize, ChannelState),
     HeaderInfo(String),
-    Timing { start: String, stop: String, duration: String },
+    Timing {
+        start: String,
+        stop: String,
+        duration: String,
+    },
     Error(String),
 }
 
@@ -40,7 +44,10 @@ enum BaselineSubtractMode {
 
 impl BaselineSubtractMode {
     fn should_subtract(self) -> bool {
-        matches!(self, BaselineSubtractMode::After | BaselineSubtractMode::AfterLog)
+        matches!(
+            self,
+            BaselineSubtractMode::After | BaselineSubtractMode::AfterLog
+        )
     }
 }
 
@@ -58,7 +65,7 @@ pub struct BaselineMode {
     progress_value: f64,
 
     // Controls
-    selected_layer_index: usize, // 0=L1,1=L2,2=L6,3=L7
+    selected_layer_index: usize,  // 0=L1,1=L2,2=L6,3=L7
     selected_x_axis_index: usize, // 0=ADC,1=Voltage
     main_mode: BaselineMainMode,
     subtract_mode: BaselineSubtractMode,
@@ -144,7 +151,11 @@ fn dirs_next_documents() -> PathBuf {
 }
 
 impl BaselineMode {
-    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
+    pub fn update(
+        &mut self,
+        ctx: &egui::Context,
+        export: &mut crate::plot_export::PlotExportQueue,
+    ) {
         self.drain_worker_messages();
 
         egui::TopBottomPanel::top("baseline_top").show(ctx, |ui| {
@@ -199,7 +210,11 @@ impl BaselineMode {
                     }
                 }
                 WorkerMsg::HeaderInfo(s) => self.header_info_text = s,
-                WorkerMsg::Timing { start, stop, duration } => {
+                WorkerMsg::Timing {
+                    start,
+                    stop,
+                    duration,
+                } => {
                     self.start_time_str = start;
                     self.stop_time_str = stop;
                     self.duration_str = duration;
@@ -221,19 +236,34 @@ impl BaselineMode {
         ui.label(&self.input_files_info);
 
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(!self.is_busy, egui::Button::new("Select Files...")).clicked() {
+            if ui
+                .add_enabled(!self.is_busy, egui::Button::new("Select Files..."))
+                .clicked()
+            {
                 self.select_files();
             }
-            if ui.add_enabled(!self.is_busy, egui::Button::new("Check Header")).clicked() {
+            if ui
+                .add_enabled(!self.is_busy, egui::Button::new("Check Header"))
+                .clicked()
+            {
                 self.check_header();
             }
         });
 
         ui.label("Output dir:");
         ui.horizontal_wrapped(|ui| {
-            ui.add(egui::Label::new(egui::RichText::new(self.output_directory_path.display().to_string()).monospace()).wrap());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(self.output_directory_path.display().to_string())
+                        .monospace(),
+                )
+                .wrap(),
+            );
             if ui.button("Browse...").clicked() {
-                if let Some(dir) = rfd::FileDialog::new().set_title("Select Output Root Folder").pick_folder() {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Select Output Root Folder")
+                    .pick_folder()
+                {
                     self.output_directory_path = dir;
                 }
             }
@@ -246,20 +276,36 @@ impl BaselineMode {
 
         if !self.header_info_text.is_empty() {
             ui.collapsing("Header Info", |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&self.header_info_text).monospace()).wrap());
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&self.header_info_text).monospace())
+                        .wrap(),
+                );
             });
         }
 
         ui.separator();
 
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(!self.is_busy && !self.selected_files.is_empty(), egui::Button::new("Pre-Process to Excel")).clicked() {
+            if ui
+                .add_enabled(
+                    !self.is_busy && !self.selected_files.is_empty(),
+                    egui::Button::new("Pre-Process to Excel"),
+                )
+                .clicked()
+            {
                 self.pre_process_data();
             }
-            if ui.add_enabled(self.is_busy, egui::Button::new("Stop")).clicked() {
-                self.status_message = "Stopping is not yet wired up for background threads in this port.".to_string();
+            if ui
+                .add_enabled(self.is_busy, egui::Button::new("Stop"))
+                .clicked()
+            {
+                self.status_message =
+                    "Stopping is not yet wired up for background threads in this port.".to_string();
             }
-            if ui.add_enabled(!self.is_busy, egui::Button::new("Process Data")).clicked() {
+            if ui
+                .add_enabled(!self.is_busy, egui::Button::new("Process Data"))
+                .clicked()
+            {
                 self.process_data();
             }
             if ui.button("Reset").clicked() {
@@ -278,8 +324,16 @@ impl BaselineMode {
                 BaselineMainMode::BaselineSetting => "Baseline setting",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.main_mode, BaselineMainMode::CutOffBaseline, "Cut off baseline");
-                ui.selectable_value(&mut self.main_mode, BaselineMainMode::BaselineSetting, "Baseline setting");
+                ui.selectable_value(
+                    &mut self.main_mode,
+                    BaselineMainMode::CutOffBaseline,
+                    "Cut off baseline",
+                );
+                ui.selectable_value(
+                    &mut self.main_mode,
+                    BaselineMainMode::BaselineSetting,
+                    "Baseline setting",
+                );
             });
 
         egui::ComboBox::from_label("Baseline")
@@ -290,10 +344,26 @@ impl BaselineMode {
                 BaselineSubtractMode::AfterLog => "After (log)",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.subtract_mode, BaselineSubtractMode::Before, "Before");
-                ui.selectable_value(&mut self.subtract_mode, BaselineSubtractMode::After, "After");
-                ui.selectable_value(&mut self.subtract_mode, BaselineSubtractMode::BeforeLog, "Before (log)");
-                ui.selectable_value(&mut self.subtract_mode, BaselineSubtractMode::AfterLog, "After (log)");
+                ui.selectable_value(
+                    &mut self.subtract_mode,
+                    BaselineSubtractMode::Before,
+                    "Before",
+                );
+                ui.selectable_value(
+                    &mut self.subtract_mode,
+                    BaselineSubtractMode::After,
+                    "After",
+                );
+                ui.selectable_value(
+                    &mut self.subtract_mode,
+                    BaselineSubtractMode::BeforeLog,
+                    "Before (log)",
+                );
+                ui.selectable_value(
+                    &mut self.subtract_mode,
+                    BaselineSubtractMode::AfterLog,
+                    "After (log)",
+                );
             });
 
         ui.checkbox(&mut self.use_thresholding, "Use Thresholding");
@@ -308,10 +378,18 @@ impl BaselineMode {
 
         ui.label("Fits:");
         let mut fits_changed = false;
-        fits_changed |= ui.checkbox(&mut self.show_gaussian_fit, "Gaussian").changed();
-        fits_changed |= ui.checkbox(&mut self.show_hemg_single_fit, "HEMG single").changed();
-        fits_changed |= ui.checkbox(&mut self.show_hemg_double_fit, "HEMG double").changed();
-        fits_changed |= ui.checkbox(&mut self.show_lorentzian_fit, "Lorentzian").changed();
+        fits_changed |= ui
+            .checkbox(&mut self.show_gaussian_fit, "Gaussian")
+            .changed();
+        fits_changed |= ui
+            .checkbox(&mut self.show_hemg_single_fit, "HEMG single")
+            .changed();
+        fits_changed |= ui
+            .checkbox(&mut self.show_hemg_double_fit, "HEMG double")
+            .changed();
+        fits_changed |= ui
+            .checkbox(&mut self.show_lorentzian_fit, "Lorentzian")
+            .changed();
         if fits_changed {
             self.recompute_fits();
         }
@@ -325,7 +403,13 @@ impl BaselineMode {
             self.status_message = "Heatmap view is not yet wired up in this port.".to_string();
         }
 
-        if ui.add_enabled(self.can_save_mean && !self.is_busy, egui::Button::new("Save Mean")).clicked() {
+        if ui
+            .add_enabled(
+                self.can_save_mean && !self.is_busy,
+                egui::Button::new("Save Mean"),
+            )
+            .clicked()
+        {
             self.save_mean();
         }
     }
@@ -367,10 +451,13 @@ impl BaselineMode {
             ui.add(egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage());
         }
         ui.label(format!("Data counts: {}", self.data_counts_str));
-        ui.add(egui::Label::new(format!(
-            "Start: {}  Stop: {}  Duration: {}",
-            self.start_time_str, self.stop_time_str, self.duration_str
-        )).wrap());
+        ui.add(
+            egui::Label::new(format!(
+                "Start: {}  Stop: {}  Duration: {}",
+                self.start_time_str, self.stop_time_str, self.duration_str
+            ))
+            .wrap(),
+        );
     }
 
     // Commands functions
@@ -589,13 +676,17 @@ fn recompute_fits_worker(snapshots: Vec<ChannelSnapshot>, flags: FitFlags, tx: S
                 hemg_single: flags.hemg_single,
                 hemg_double: flags.hemg_double,
             };
-            let (stats, fits) = fit_overlay::compute_fits(&math, &snap.bin_centers, &snap.counts, &overlay_flags);
+            let (stats, fits) =
+                fit_overlay::compute_fits(&math, &snap.bin_centers, &snap.counts, &overlay_flags);
             state.mu = stats.mu;
             state.sigma = stats.sigma;
             state.fwhm = stats.fwhm;
             state.resolution = stats.resolution;
 
-            state.stats_text = format!("mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%", state.mu, state.sigma, state.fwhm, state.resolution);
+            state.stats_text = format!(
+                "mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%",
+                state.mu, state.sigma, state.fwhm, state.resolution
+            );
             state.bin_centers = snap.bin_centers;
             state.counts = snap.counts;
             state.active_fits = fits;
@@ -606,7 +697,10 @@ fn recompute_fits_worker(snapshots: Vec<ChannelSnapshot>, flags: FitFlags, tx: S
     for (idx, state) in results {
         let _ = tx.send(WorkerMsg::ChannelResult(idx, state));
     }
-    let _ = tx.send(WorkerMsg::Status("Refit complete.".to_string(), Color32::from_rgb(50, 200, 50)));
+    let _ = tx.send(WorkerMsg::Status(
+        "Refit complete.".to_string(),
+        Color32::from_rgb(50, 200, 50),
+    ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
@@ -631,13 +725,14 @@ fn layer_id_of(layer_index: usize) -> u32 {
 
 fn merge_files_worker(files: Vec<PathBuf>, output_dir: PathBuf, tx: Sender<WorkerMsg>) {
     let today = chrono::Local::now().date_naive();
-    let dir = match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(format!("Merge Error: {e}")));
-            return;
-        }
-    };
+    let dir =
+        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(format!("Merge Error: {e}")));
+                return;
+            }
+        };
     let combined_path = dir.join("multiple_file_output.txt");
 
     let result: std::io::Result<()> = (|| {
@@ -655,8 +750,13 @@ fn merge_files_worker(files: Vec<PathBuf>, output_dir: PathBuf, tx: Sender<Worke
                 "Merged into {}",
                 combined_path.display()
             )));
-            let _ = tx.send(WorkerMsg::OutputFileName("multiple_file_output.xlsx".to_string()));
-            let _ = tx.send(WorkerMsg::Status("Merge Complete. Ready.".to_string(), Color32::from_rgb(50, 200, 50)));
+            let _ = tx.send(WorkerMsg::OutputFileName(
+                "multiple_file_output.xlsx".to_string(),
+            ));
+            let _ = tx.send(WorkerMsg::Status(
+                "Merge Complete. Ready.".to_string(),
+                Color32::from_rgb(50, 200, 50),
+            ));
         }
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(format!("Merge Error: {e}")));
@@ -665,11 +765,19 @@ fn merge_files_worker(files: Vec<PathBuf>, output_dir: PathBuf, tx: Sender<Worke
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn pre_process_worker(files: Vec<PathBuf>, output_dir: PathBuf, output_file_name: String, tx: Sender<WorkerMsg>) {
+fn pre_process_worker(
+    files: Vec<PathBuf>,
+    output_dir: PathBuf,
+    output_file_name: String,
+    tx: Sender<WorkerMsg>,
+) {
     let mut all_data = Vec::new();
 
     for (i, file) in files.iter().enumerate() {
-        let _ = tx.send(WorkerMsg::Status(format!("Processing file {}/{}...", i + 1, files.len()), Color32::from_rgb(255, 165, 0)));
+        let _ = tx.send(WorkerMsg::Status(
+            format!("Processing file {}/{}...", i + 1, files.len()),
+            Color32::from_rgb(255, 165, 0),
+        ));
         match io::process_file_stream(file, None) {
             Ok(mut data) => all_data.append(&mut data),
             Err(e) => {
@@ -681,7 +789,10 @@ fn pre_process_worker(files: Vec<PathBuf>, output_dir: PathBuf, output_file_name
     }
 
     if all_data.is_empty() {
-        let _ = tx.send(WorkerMsg::Status("No valid data found in selected files.".to_string(), Color32::RED));
+        let _ = tx.send(WorkerMsg::Status(
+            "No valid data found in selected files.".to_string(),
+            Color32::RED,
+        ));
         let _ = tx.send(WorkerMsg::Busy(false));
         return;
     }
@@ -692,17 +803,21 @@ fn pre_process_worker(files: Vec<PathBuf>, output_dir: PathBuf, output_file_name
     }
 
     let today = chrono::Local::now().date_naive();
-    let dir = match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(e.to_string()));
-            let _ = tx.send(WorkerMsg::Busy(false));
-            return;
-        }
-    };
+    let dir =
+        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(e.to_string()));
+                let _ = tx.send(WorkerMsg::Busy(false));
+                return;
+            }
+        };
     let full_path = dir.join(&file_name);
 
-    let _ = tx.send(WorkerMsg::Status("Saving to Excel...".to_string(), Color32::from_rgb(255, 165, 0)));
+    let _ = tx.send(WorkerMsg::Status(
+        "Saving to Excel...".to_string(),
+        Color32::from_rgb(255, 165, 0),
+    ));
     match io::excel::save_baseline_to_excel(&all_data, &full_path) {
         Ok(()) => {
             let _ = tx.send(WorkerMsg::Status(
@@ -717,7 +832,12 @@ fn pre_process_worker(files: Vec<PathBuf>, output_dir: PathBuf, output_file_name
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: ProcessConfig, tx: Sender<WorkerMsg>) {
+fn process_data_worker(
+    output_dir: PathBuf,
+    output_file_name: String,
+    config: ProcessConfig,
+    tx: Sender<WorkerMsg>,
+) {
     let start = chrono::Local::now();
 
     let mut file_name = output_file_name;
@@ -725,14 +845,15 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
         file_name.push_str(".xlsx");
     }
     let today = chrono::Local::now().date_naive();
-    let dir = match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(e.to_string()));
-            let _ = tx.send(WorkerMsg::Busy(false));
-            return;
-        }
-    };
+    let dir =
+        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(e.to_string()));
+                let _ = tx.send(WorkerMsg::Busy(false));
+                return;
+            }
+        };
     let full_path = dir.join(&file_name);
 
     if !full_path.exists() {
@@ -744,7 +865,10 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
         return;
     }
 
-    let _ = tx.send(WorkerMsg::Status("Reading Excel...".to_string(), Color32::from_rgb(255, 165, 0)));
+    let _ = tx.send(WorkerMsg::Status(
+        "Reading Excel...".to_string(),
+        Color32::from_rgb(255, 165, 0),
+    ));
     let data = match io::excel::read_baseline_excel(&full_path) {
         Ok(d) => d,
         Err(e) => {
@@ -769,12 +893,19 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
     let results: Vec<(usize, ChannelState)> = (0..16usize)
         .into_par_iter()
         .map(|ch_index| {
-            let raw_data: Vec<f64> = data.iter().map(|d| layer_of(d, config.layer_index)[ch_index] as f64).collect();
+            let raw_data: Vec<f64> = data
+                .iter()
+                .map(|d| layer_of(d, config.layer_index)[ch_index] as f64)
+                .collect();
 
             let mut working = raw_data.clone();
             if config.should_subtract {
                 let mean = if !config.baseline_setting_mode {
-                    let m = baseline_core::baseline_processing::load_mean_from_file(&output_dir_for_means, layer_id_of(config.layer_index), ch_index);
+                    let m = baseline_core::baseline_processing::load_mean_from_file(
+                        &output_dir_for_means,
+                        layer_id_of(config.layer_index),
+                        ch_index,
+                    );
                     if m == 0.0 {
                         baseline_core::baseline_processing::calculate_mean(&raw_data)
                     } else {
@@ -788,7 +919,11 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
                 }
             }
 
-            let filtered = baseline_core::baseline_processing::apply_thresholding(&working, config.k_factor, config.use_thresholding);
+            let filtered = baseline_core::baseline_processing::apply_thresholding(
+                &working,
+                config.k_factor,
+                config.use_thresholding,
+            );
 
             let mut state = ChannelState {
                 channel_index: ch_index,
@@ -817,7 +952,8 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
                     hemg_single: config.show_hemg_single_fit,
                     hemg_double: config.show_hemg_double_fit,
                 };
-                let (stats, computed) = fit_overlay::compute_fits(&math, &bin_centers, &counts, &overlay_flags);
+                let (stats, computed) =
+                    fit_overlay::compute_fits(&math, &bin_centers, &counts, &overlay_flags);
                 state.mu = stats.mu;
                 state.sigma = stats.sigma;
                 state.fwhm = stats.fwhm;
@@ -825,7 +961,10 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
                 fits = computed;
             }
 
-            state.stats_text = format!("mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%", state.mu, state.sigma, state.fwhm, state.resolution);
+            state.stats_text = format!(
+                "mu={:.2} sigma={:.2} fwhm={:.2} res={:.2}%",
+                state.mu, state.sigma, state.fwhm, state.resolution
+            );
             state.counts = counts;
             state.bin_centers = bin_centers;
             state.active_fits = fits;
@@ -845,42 +984,60 @@ fn process_data_worker(output_dir: PathBuf, output_file_name: String, config: Pr
         stop: stop.format("%H:%M:%S").to_string(),
         duration: format!("{} ms", duration.num_milliseconds()),
     });
-    let _ = tx.send(WorkerMsg::Status(format!("Processed {} events.", data.len()), Color32::from_rgb(50, 200, 50)));
+    let _ = tx.send(WorkerMsg::Status(
+        format!("Processed {} events.", data.len()),
+        Color32::from_rgb(50, 200, 50),
+    ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
 fn save_mean_worker(data: Vec<BaselineData>, output_dir: PathBuf, tx: Sender<WorkerMsg>) {
     let today = chrono::Local::now().date_naive();
-    let dir = match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.send(WorkerMsg::Error(e.to_string()));
-            let _ = tx.send(WorkerMsg::Busy(false));
-            return;
-        }
-    };
+    let dir =
+        match baseline_core::baseline_processing::get_daily_output_directory(&output_dir, today) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(e.to_string()));
+                let _ = tx.send(WorkerMsg::Busy(false));
+                return;
+            }
+        };
 
     let layers: [(u32, fn(&BaselineData) -> [f32; 16]); 4] =
         [(1, |d| d.l1), (2, |d| d.l2), (6, |d| d.l6), (7, |d| d.l7)];
 
     for (layer_id, selector) in layers {
         let means = baseline_core::baseline_processing::calculate_mean_parallel(&data, selector);
-        if let Err(e) = baseline_core::baseline_processing::write_means_to_file(&dir, layer_id, &means) {
+        if let Err(e) =
+            baseline_core::baseline_processing::write_means_to_file(&dir, layer_id, &means)
+        {
             let _ = tx.send(WorkerMsg::Error(format!("Error saving means: {e}")));
             let _ = tx.send(WorkerMsg::Busy(false));
             return;
         }
     }
 
-    let _ = tx.send(WorkerMsg::Status("Mean Values Saved Successfully.".to_string(), Color32::from_rgb(50, 200, 50)));
+    let _ = tx.send(WorkerMsg::Status(
+        "Mean Values Saved Successfully.".to_string(),
+        Color32::from_rgb(50, 200, 50),
+    ));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn check_header_worker(file_path: PathBuf, delay_time_ms: i32, k_factor: f64, tx: Sender<WorkerMsg>) {
-    let text = check_header_summary(&file_path, delay_time_ms, k_factor).unwrap_or_else(|e| format!("Error: {e}"));
+fn check_header_worker(
+    file_path: PathBuf,
+    delay_time_ms: i32,
+    k_factor: f64,
+    tx: Sender<WorkerMsg>,
+) {
+    let text = check_header_summary(&file_path, delay_time_ms, k_factor)
+        .unwrap_or_else(|e| format!("Error: {e}"));
     let _ = tx.send(WorkerMsg::HeaderInfo(text));
-    let _ = tx.send(WorkerMsg::Status("Header Analysis Complete.".to_string(), Color32::GRAY));
+    let _ = tx.send(WorkerMsg::Status(
+        "Header Analysis Complete.".to_string(),
+        Color32::GRAY,
+    ));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
@@ -905,7 +1062,10 @@ fn check_header_summary(path: &Path, delay_time_ms: i32, k_factor: f64) -> std::
     let tail_hex = String::from_utf8_lossy(&tail_buf).to_string();
 
     let mut out = String::new();
-    out.push_str(&format!("File Size: {:.2} MB\n", file_len as f64 / (1024.0 * 1024.0)));
+    out.push_str(&format!(
+        "File Size: {:.2} MB\n",
+        file_len as f64 / (1024.0 * 1024.0)
+    ));
     out.push_str("--------------------------------------------------\n");
     out.push_str("[START OF FILE]\n");
     match parse_first_packet(&head_hex) {
@@ -932,7 +1092,7 @@ fn clean_hex(s: &str) -> String {
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())
@@ -949,7 +1109,7 @@ fn parse_first_packet(hex_content: &str) -> Option<Vec<u8>> {
     if clean.len() > 4128 {
         clean.truncate(4128);
     }
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         clean.pop();
     }
     hex_to_bytes(&clean)
@@ -968,7 +1128,7 @@ fn find_last_packet(hex_content: &str) -> Option<Vec<u8>> {
         hex_to_bytes(&clean[last_index..last_index + expected_hex_length])
     } else {
         let mut partial = clean[last_index..].to_string();
-        if partial.len() % 2 != 0 {
+        if !partial.len().is_multiple_of(2) {
             partial.pop();
         }
         hex_to_bytes(&partial)
@@ -983,8 +1143,9 @@ fn parse_header_summary(data: &[u8]) -> String {
     let milliseconds_part = ((data[13] as u16) << 8) | data[12] as u16;
 
     let total_ms = seconds_part as i64 * 1000 + milliseconds_part as i64;
-    let dt = chrono::DateTime::from_timestamp(total_ms / 1000, ((total_ms % 1000) * 1_000_000) as u32)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+    let dt =
+        chrono::DateTime::from_timestamp(total_ms / 1000, ((total_ms % 1000) * 1_000_000) as u32)
+            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
 
     format!(
         "Timestamp: {} (UTC)\nSync Code: {:02X} {:02X}\nSeq No:    {:02X} {:02X}",

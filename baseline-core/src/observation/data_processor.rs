@@ -1,12 +1,4 @@
-//! Direct transcription of `Infrastructure/Services/Observation/DataProcessor.cs`
-//! (`ObservationDataProcessor`).
-//!
-//! The C# stored each particle's decoded fields in a loosely-typed
-//! `Dictionary<string, object>` (kept, per its own comments, "for legacy
-//! UI binding"); since there is no WPF binding to replicate here, that is
-//! represented as the typed [`ParticleResult`] instead. `StorageDataList`
-//! and `AllResults` held the exact same objects in the same order in the
-//! original, so they're collapsed into the single `results` field.
+//! Data Processing for Observation Mode
 
 use crate::math::KalmanFilter;
 use crate::models::observation::{BgoData, BgoLayer, DetectorLayer, LayerData};
@@ -20,32 +12,115 @@ const PARTICLE_DATA_LENGTH: usize = 34;
 const PARTICLES_PER_LINE: usize = 5;
 const HISTOGRAM_SIZE: usize = 16384;
 
+/// Contruct a line's tail fields
+pub struct LineTailField {
+    pub label: &'static str,
+    pub byte_start: usize,
+    pub byte_len: usize,
+    pub is_hex: bool,
+}
+
+const fn dec(label: &'static str, byte_start: usize, byte_len: usize) -> LineTailField {
+    LineTailField { label, byte_start, byte_len, is_hex: false }
+}
+
+pub const LINE_TAIL_FIELDS: &[LineTailField] = &[
+    dec("Galactic Electron Count", 186, 1),
+    dec("Albedo Electron Count", 187, 1),
+    dec("Galactic Ion Count", 188, 1),
+    dec("Albedo Ion Count", 189, 1),
+    dec("L1 Ion Threshold", 190, 2),
+    dec("L1 Electron Threshold", 192, 2),
+    dec("L2 Ion Particle", 194, 2),
+    dec("L2 Electron Particle", 196, 2),
+    dec("L3 Ion Particle", 198, 2),
+    dec("L3 Electron Particle", 200, 2),
+    dec("L4 Ion Particle", 202, 2),
+    dec("L4 Electron Particle", 204, 2),
+    dec("L5 Ion Particle", 206, 2),
+    dec("L5 Electron Particle", 208, 2),
+    dec("L6 Ion Particle", 210, 2),
+    dec("L6 Electron Particle", 212, 2),
+    dec("L7 Ion Particle", 214, 2),
+    dec("L7 Electron Particle", 216, 2),
+    dec("DSSD1 Temperature", 218, 2),
+    dec("FEE1 Current", 220, 2),
+    dec("FEE1 Temperature", 222, 2),
+    dec("DSSD7 Temperature", 224, 2),
+    dec("FEE2 Current", 226, 2),
+    dec("FEE2 Temperature", 228, 2),
+    dec("FEE1 Threshold", 230, 2),
+    dec("FEE2 Threshold", 232, 2),
+    dec("BGO1 Bias Voltage", 234, 2),
+    dec("BGO2 Bias Voltage", 236, 2),
+    dec("BGO3 Bias Voltage", 238, 2),
+    dec("BGO2 Temperature", 240, 2),
+    LineTailField { label: "Padding", byte_start: 242, byte_len: 12, is_hex: true },
+    LineTailField { label: "Checksum", byte_start: 254, byte_len: 2, is_hex: true },
+];
+
+/// Formular decode for FEE2 Temperature and the BGO bias/temperature fields.
+fn formula_decode(x: f64) -> f64 {
+    65.17 * (x * 4096.0 / 3.3).powf(0.1401) - 141.6
+}
+
+/// Fields whose raw decoded value must be run through `formula_decode`.
+/// BGO bias-voltage/temperature fields additionally get scaled by 0.01.
+fn calibrated_value(label: &str, raw: f64) -> Option<f64> {
+    match label {
+        "FEE2 Temperature" => Some(formula_decode(raw)),
+        "BGO1 Bias Voltage" | "BGO2 Bias Voltage" | "BGO3 Bias Voltage" | "BGO2 Temperature" => {
+            Some(formula_decode(raw) * 0.01)
+        }
+        _ => None,
+    }
+}
+
+/// Decoding LINE_TAIL_FIELDS
+fn parse_line_tail_fields(hex_data: &[String]) -> Vec<String> {
+    let byte = |i: usize| -> i32 { hex_data.get(i).and_then(|h| i32::from_str_radix(h, 16).ok()).unwrap_or(0) };
+    LINE_TAIL_FIELDS
+        .iter()
+        .map(|f| {
+            if f.is_hex {
+                (f.byte_start..f.byte_start + f.byte_len).map(|i| hex_data.get(i).cloned().unwrap_or_else(|| "00".to_string())).collect()
+            } else if f.byte_len == 1 {
+                let raw = byte(f.byte_start);
+                match calibrated_value(f.label, raw as f64) {
+                    Some(value) => format!("{value:.4}"),
+                    None => raw.to_string(),
+                }
+            } else {
+                let raw = (byte(f.byte_start) << 8) + byte(f.byte_start + 1);
+                match calibrated_value(f.label, raw as f64) {
+                    Some(value) => format!("{value:.4}"),
+                    None => raw.to_string(),
+                }
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParticleResult {
     pub particle_data: Vec<String>,
     pub particle_number: i32,
+    /// Raw decoded decimal value of the Particle Time field (Byte 0-1).
+    pub particle_time_raw: i32,
     pub milliseconds: i32,
-    /// The event's absolute time: the containing line's timecode (decoded
-    /// via `get_date_time_from_hex_data`) plus this particle's own
-    /// `milliseconds` offset - every particle on the same line shares the
-    /// line's timecode but gets a distinct sub-second offset from it.
     pub time: DateTime<Utc>,
     /// (X, Y) pulse heights per DSSD layer.
     pub dssd_pulses: HashMap<DetectorLayer, (i32, i32)>,
+    /// Raw decoded decimal value of the XY Position byte per DSSD layer.
+    pub dssd_positions: HashMap<DetectorLayer, i32>,
     /// (High gain, Low gain) pulse heights per BGO layer.
     pub bgo_pulses: HashMap<BgoLayer, (i32, i32)>,
-    /// Line header fields surrounding the byte 8-13 timecode - see
-    /// `parse_line_header_fields`. Line-level, not particle-level: every
-    /// particle on the same line carries the same five values, matching how
-    /// they all share the line's timecode. `packet_sync`/`data_type` stay
-    /// raw hex (e.g. `"E225"`) - they're markers/type codes, not
-    /// measurements; `package_id`/`packet_sequence`/`packet_data_length` are
-    /// decoded to decimal, like the rest of the payload.
     pub packet_sync: String,
     pub package_id: i32,
     pub packet_sequence: i32,
     pub packet_data_length: i32,
     pub data_type: String,
+    pub line_tail: Vec<String>,
 }
 
 pub struct ObservationDataProcessor {
@@ -114,11 +189,9 @@ impl ObservationDataProcessor {
             layer.high_gain.clear();
             layer.low_gain.clear();
         }
-        // Kalman filters are not reset here, matching the C# original.
     }
 
     /// Processes multiple files, returning per-layer X/Y pulse-height
-    /// histograms keyed `"DSSD{layer}_X"` / `"DSSD{layer}_Y"`.
     pub fn process_files(&mut self, file_paths: &[impl AsRef<Path>]) -> Result<HashMap<String, Vec<i32>>, String> {
         self.clear_data();
         for path in file_paths {
@@ -135,13 +208,13 @@ impl ObservationDataProcessor {
                 continue;
             }
             let hex_data = split_hex_data(trimmed);
+            // A package shorter than 256 bytes (512 hex characters) are skipped
+            if hex_data.len() < 256 {
+                continue;
+            }
             if hex_data.len() >= HEADER_OFFSET + PARTICLE_DATA_LENGTH {
-                // Best-effort: an undecodable line timecode falls back to the
-                // Unix epoch rather than skipping the line's particles
-                // entirely, matching `get_date_time_from_hex`'s epoch
-                // fallback in `flux::processing`.
-                let line_time = get_date_time_from_hex_data(&hex_data).unwrap_or_else(|_| DateTime::from_timestamp(0, 0).unwrap());
                 let header = parse_line_header_fields(&hex_data).unwrap_or_default();
+                let line_time = get_date_time_from_hex_data(&hex_data).unwrap_or_else(|_| DateTime::from_timestamp(0, 0).unwrap());
                 self.process_particles(&hex_data, line_time, &header);
             }
         }
@@ -185,24 +258,7 @@ impl ObservationDataProcessor {
     }
 
     /// Builds fixed-size (`HISTOGRAM_SIZE`-channel) count histograms for every
-    /// DSSD pulse-height/strip series and every BGO gain series, keyed so the
-    /// UI can look up whichever layer/strip/mode the user has selected
-    /// without having to reprocess the source files. Mirrors
-    /// `RefreshDSSDPlots`/`RefreshBGOPlots` in the original WPF code-behind,
-    /// minus the dynamic bin-range and curve-fitting logic (deferred - see
-    /// module notes).
-    ///
-    /// Every particle contributes a pulse-height entry to every DSSD/BGO
-    /// layer regardless of whether that layer actually fired (see
-    /// `process_dssd_layer`/`process_bgo_layer`), so most particles record a
-    /// `0` in the layers they didn't hit. The main X/Y and BGO histograms
-    /// drop those zeros (`histogram_of_positive`), matching the original's
-    /// `PlotHistogram`/`PlotBGOHistogram` (`data.Where(v => v > 0)`) -
-    /// otherwise channel 0 accumulates a massive non-physical spike that
-    /// wins every peak search and gets handed to the Gaussian/Lorentzian fit
-    /// instead of the real photopeak. Strip histograms intentionally keep
-    /// zeros, matching `PlotStripHistogram`'s `v >= xMin` filter (default
-    /// `xMin = 0`).
+    /// DSSD pulse-height/strip series and every BGO gain series
     fn get_histogram_data(&self) -> HashMap<String, Vec<i32>> {
         let mut result = HashMap::new();
 
@@ -233,6 +289,7 @@ impl ObservationDataProcessor {
     }
 
     pub fn process_particles(&mut self, hex_data: &[String], line_time: DateTime<Utc>, header: &LineHeaderFields) {
+        let line_tail = parse_line_tail_fields(hex_data);
         for i in 0..PARTICLES_PER_LINE {
             let start = HEADER_OFFSET + PARTICLE_DATA_LENGTH * i;
             if start >= hex_data.len() {
@@ -244,13 +301,20 @@ impl ObservationDataProcessor {
                 break;
             }
 
-            if let Ok(processed) = self.process_particle_data(particle_data, i, line_time, header) {
+            if let Ok(processed) = self.process_particle_data(particle_data, i, line_time, header, &line_tail) {
                 self.results.push(processed);
             }
         }
     }
 
-    pub fn process_particle_data(&mut self, particle_data: &[String], i: usize, line_time: DateTime<Utc>, header: &LineHeaderFields) -> Result<ParticleResult, String> {
+    pub fn process_particle_data(
+        &mut self,
+        particle_data: &[String],
+        i: usize,
+        line_time: DateTime<Utc>,
+        header: &LineHeaderFields,
+        line_tail: &[String],
+    ) -> Result<ParticleResult, String> {
         let particle_data_dec: Vec<i32> = particle_data
             .iter()
             .map(|hex| i32::from_str_radix(hex, 16).map_err(|e| e.to_string()))
@@ -260,7 +324,8 @@ impl ObservationDataProcessor {
             return Err("Insufficient particle data".to_string());
         }
 
-        let milliseconds = (((particle_data_dec[0] << 8) + particle_data_dec[1]) / 1000) as i32;
+        let particle_time_raw = (particle_data_dec[0] << 8) + particle_data_dec[1];
+        let milliseconds = particle_time_raw / 1000;
         let time = line_time + chrono::Duration::milliseconds(milliseconds as i64);
 
         // --- DSSD layers ---
@@ -269,10 +334,11 @@ impl ObservationDataProcessor {
         // L6: pos idx 24, X-Ph idx 25-26, Y-Ph idx 27-28
         // L7: pos idx 29, X-Ph idx 30-31, Y-Ph idx 32-33
         let mut dssd_pulses = HashMap::new();
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L1, 2, 3, 5, &mut dssd_pulses);
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L2, 7, 8, 10, &mut dssd_pulses);
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L6, 24, 25, 27, &mut dssd_pulses);
-        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L7, 29, 30, 32, &mut dssd_pulses);
+        let mut dssd_positions = HashMap::new();
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L1, 2, 3, 5, &mut dssd_pulses, &mut dssd_positions);
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L2, 7, 8, 10, &mut dssd_pulses, &mut dssd_positions);
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L6, 24, 25, 27, &mut dssd_pulses, &mut dssd_positions);
+        self.process_dssd_layer(&particle_data_dec, DetectorLayer::L7, 29, 30, 32, &mut dssd_pulses, &mut dssd_positions);
 
         // --- BGO layers ---
         // L3: H idx 12-13, L idx 14-15
@@ -286,15 +352,18 @@ impl ObservationDataProcessor {
         Ok(ParticleResult {
             particle_data: particle_data.to_vec(),
             particle_number: i as i32 + 1,
+            particle_time_raw,
             milliseconds,
             time,
             dssd_pulses,
+            dssd_positions,
             bgo_pulses,
             packet_sync: header.packet_sync.clone(),
             package_id: header.package_id,
             packet_sequence: header.packet_sequence,
             packet_data_length: header.packet_data_length,
             data_type: header.data_type.clone(),
+            line_tail: line_tail.to_vec(),
         })
     }
 
@@ -306,20 +375,20 @@ impl ObservationDataProcessor {
         x_ph_idx: usize,
         y_ph_idx: usize,
         out: &mut HashMap<DetectorLayer, (i32, i32)>,
+        positions: &mut HashMap<DetectorLayer, i32>,
     ) {
-        let detect_x = (data[pos_idx] & 240) >> 4; // upper 4 bits
-        let detect_y = data[pos_idx] & 15; // lower 4 bits
+        let detect_x = (data[pos_idx] & 240) >> 4;
+        let detect_y = data[pos_idx] & 15;
 
         let ph_x = (data[x_ph_idx] << 8) + data[x_ph_idx + 1];
         let ph_y = (data[y_ph_idx] << 8) + data[y_ph_idx + 1];
         out.insert(layer, (ph_x, ph_y));
+        positions.insert(layer, data[pos_idx]);
 
         let layer_data = self.dssd_data.get_mut(&layer).unwrap();
         layer_data.pulse_height_x.push(ph_x as f64);
         layer_data.pulse_height_y.push(ph_y as f64);
 
-        // Strip key mapping (see original comments): detect==8 -> strip 0,
-        // otherwise detect+1 -> strip (detect+1).
         let target_strip_x = if detect_x == 8 { 0 } else { detect_x + 1 };
         let target_strip_y = if detect_y == 8 { 0 } else { detect_y + 1 };
 
@@ -372,8 +441,7 @@ fn bgo_layer_name(layer: BgoLayer) -> &'static str {
     }
 }
 
-/// Excludes non-positive values - see `get_histogram_data`'s doc comment
-/// for why this matters for the main DSSD X/Y and BGO histograms.
+/// Excludes non-positive values
 fn histogram_of_positive(values: &[f64]) -> Vec<i32> {
     let mut hist = vec![0i32; HISTOGRAM_SIZE];
     for &value in values {
@@ -395,9 +463,6 @@ fn histogram_of_i32(values: &[i32]) -> Vec<i32> {
     hist
 }
 
-/// The instrument's own timecode base: the 6-byte timecode this function
-/// decodes (4-byte seconds + 2-byte milliseconds) counts up from this
-/// moment, not from the Unix epoch.
 fn observation_epoch() -> DateTime<Utc> {
     DateTime::from_naive_utc_and_offset(NaiveDate::from_ymd_opt(2024, 10, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(), Utc)
 }
@@ -418,10 +483,7 @@ pub fn get_date_time_from_hex_data(hex_data: &[String]) -> Result<DateTime<Utc>,
     Ok(observation_epoch() + chrono::Duration::seconds(seconds_part as i64) + chrono::Duration::milliseconds(milliseconds_part as i64))
 }
 
-/// The line-header fields surrounding the byte 8-13 timecode - see
-/// `parse_line_header_fields`. `packet_sync`/`data_type` stay raw hex (e.g.
-/// `"E225"`) since they're a fixed marker and a type code, not measurements;
-/// the rest decode to decimal like the rest of the payload.
+/// The line-header fields
 #[derive(Debug, Clone, Default)]
 pub struct LineHeaderFields {
     pub packet_sync: String,
@@ -431,13 +493,8 @@ pub struct LineHeaderFields {
     pub data_type: String,
 }
 
-/// Decodes the line-header fields around the timecode: Packet Sync Code
-/// (bytes 0-1, raw hex), Package ID (2-3, decimal), Packet Sequence (4-5,
-/// decimal), Packet Data Length (6-7, decimal), the byte 8-13 timecode
-/// itself (`get_date_time_from_hex_data`, decoded separately), then Data
-/// Type (14-15, raw hex) - mirrors the identical 16-byte header layout
-/// `flux::processing::process_header_internal` decodes for its own (much
-/// larger) E225 packets.
+/// Decodes the line-header fields around the timecode: Packet Sync Code, Package ID, Packet Sequence,
+/// Packet Data Lengtgh, and Data Type
 pub fn parse_line_header_fields(hex_data: &[String]) -> Option<LineHeaderFields> {
     if hex_data.len() < 16 {
         return None;

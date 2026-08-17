@@ -35,7 +35,7 @@ pub struct ChannelState {
 impl ChannelState {
     pub fn ui(&mut self, ui: &mut egui::Ui, export: &mut PlotExportQueue) {
         ui.vertical(|ui| {
-            ui.horizontal(|ui| {
+            let header = ui.horizontal(|ui| {
                 ui.strong(&self.title);
                 if self.is_fitting {
                     ui.spinner();
@@ -45,9 +45,14 @@ impl ChannelState {
             ui.label(&self.stats_text);
 
             let id_source = format!("channel_plot_{}", self.channel_index);
-            let plot = Plot::new(id_source.clone()).height(220.0).allow_scroll(true).legend(egui_plot::Legend::default());
+            let plot = Plot::new(id_source.clone())
+                .height(220.0)
+                .allow_scroll(true)
+                .legend(egui_plot::Legend::default())
+                .custom_x_axes(vec![plot_export::x_axis("ADC Channel")])
+                .custom_y_axes(vec![plot_export::y_axis("Counts")]);
 
-            plot_export::show(ui, export, &id_source, &self.title, plot, |plot_ui| {
+            plot_export::show(ui, export, &id_source, &self.title, 220.0, Some(header.response.rect), plot, |plot_ui| {
                 if !self.counts.is_empty() && self.bin_centers.len() == self.counts.len() {
                     // Data renders as a bar histogram (matching the original's
                     // `AddBar`), except in log scale where bars of near-zero

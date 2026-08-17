@@ -14,7 +14,26 @@
                 "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
-                "$rustc"
+                {
+                    "owner": "rustc",
+                    "source": "rustc",
+                    "fileLocation": ["autoDetect", "${workspaceFolder}"],
+                    "severity": "error",
+                    "pattern": [
+                        {
+                            "regexp": "^(warning|warn|error)(\\[(.*?)\\])?: (.*)$",
+                            "severity": 1,
+                            "code": 3,
+                            "message": 4
+                        },
+                        {
+                            "regexp": "^[\\s->]*(.*?):(\\d*):(\\d*)$",
+                            "file": 1,
+                            "line": 2,
+                            "column": 3
+                        }
+                    ]
+                }
             ],
             "group": {
                 "kind": "build",
@@ -29,8 +48,61 @@
                 "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
-                "$rustc"
+                {
+                    "owner": "rustc",
+                    "source": "rustc",
+                    "fileLocation": ["autoDetect", "${workspaceFolder}"],
+                    "severity": "error",
+                    "pattern": [
+                        {
+                            "regexp": "^(warning|warn|error)(\\[(.*?)\\])?: (.*)$",
+                            "severity": 1,
+                            "code": 3,
+                            "message": 4
+                        },
+                        {
+                            "regexp": "^[\\s->]*(.*?):(\\d*):(\\d*)$",
+                            "file": 1,
+                            "line": 2,
+                            "column": 3
+                        }
+                    ]
+                }
             ]
+        },
+        {
+            "label": "kill stale baseline-app.exe",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/.vscode/kill-baseline-app.ps1",
+                "-WorkspaceFolder", "${workspaceFolder}"
+            ],
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "build + kill stale (debug)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "kill stale baseline-app.exe",
+                "cargo build (baseline-app debug)"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "build + kill stale (release)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "kill stale baseline-app.exe",
+                "cargo build (baseline-app release)"
+            ],
+            "problemMatcher": []
         }
     ]
 }

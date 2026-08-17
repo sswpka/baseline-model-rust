@@ -1,18 +1,24 @@
-//! Right-click "image" menu for `egui_plot::Plot`s, shared by every mode
-//! (Baseline/Calibration via `channel.rs`, Flux, and Observation): Save
-//! image as..., Copy image, Zoom to fit data, Open image in new window.
-//! This is the deferred `CalibrationDetailWindow`/`OpenZoomWindow` feature
-//! from the original app, generalized to every plot via one mechanism
-//! instead of a per-mode detail window.
-//!
-//! `egui`'s screenshot API (`ViewportCommand::Screenshot` /
-//! `Event::Screenshot`) captures the whole native window, not a widget, and
-//! carries no per-request tag - so only one export request is tracked at a
-//! time (`pending`), and the plot's on-screen rect is cropped out of the
-//! next screenshot that arrives.
+//! Function for handling the Right-click "image" menu for `egui_plot::Plot`s, shared by every mode: Save image as..., Copy image, Zoom to fit data, Open image in new window.
+//! Screenshot captures the whole native window
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+
+use egui_plot::AxisHints;
+
+/// Color for axis titles, tick numbers, and grid lines
+const PLOT_TEXT_COLOR: egui::Color32 = egui::Color32::LIGHT_GRAY;
+
+/// X-axis hint with a fixed label and a fade range narrow enough that tick
+/// numbers are effectively always at full opacity instead of fading in/out
+pub fn x_axis(label: impl Into<egui::WidgetText>) -> AxisHints<'static> {
+    AxisHints::new_x().label(label).label_spacing(60.0..=61.0)
+}
+
+/// Same as `x_axis`, for the Y axis
+pub fn y_axis(label: impl Into<egui::WidgetText>) -> AxisHints<'static> {
+    AxisHints::new_y().label(label).label_spacing(20.0..=21.0)
+}
 
 enum ExportAction {
     Save,
@@ -30,25 +36,18 @@ struct OpenImageWindow {
     id: egui::ViewportId,
     title: String,
     texture: egui::TextureHandle,
-    /// Display size in points (the texture itself is sized in physical
-    /// pixels, since it comes from a screenshot captured at
-    /// `pixels_per_point` scale).
     size: egui::Vec2,
 }
 
 #[derive(Default)]
 pub struct PlotExportQueue {
     pending: Option<PendingExport>,
-    /// `id_source` strings (matching each plot's `Plot::new(id_source)`)
-    /// that should have `.reset()` applied on their next `show()`.
     zoom_to_fit: HashSet<String>,
     open_windows: Vec<OpenImageWindow>,
     next_window_id: u64,
 }
 
 impl PlotExportQueue {
-    /// Call once per frame, before any mode UI runs: consumes this frame's
-    /// `Event::Screenshot` (if any) against `pending` and dispatches it.
     pub fn process_screenshot(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending.take() else { return };
 
@@ -60,7 +59,6 @@ impl PlotExportQueue {
         });
 
         let Some(image) = image else {
-            // Not delivered yet - keep waiting next frame.
             self.pending = Some(pending);
             ctx.request_repaint();
             return;
@@ -79,8 +77,6 @@ impl PlotExportQueue {
         }
     }
 
-    /// Call once per frame, unconditionally (independent of which mode tab
-    /// is active), so windows opened from any mode keep rendering.
     pub fn show_open_windows(&mut self, ctx: &egui::Context) {
         self.open_windows.retain(|w| {
             ctx.show_viewport_immediate(
@@ -105,40 +101,36 @@ impl PlotExportQueue {
     }
 }
 
-/// Wraps `plot.show(...)` with the right-click image menu. `id_source` must
-/// be the same string passed to `Plot::new(id_source)`, so "Zoom to fit
-/// data" can flag the right plot for `.reset()` on its next frame. `title`
-/// seeds the save-dialog default filename and the new window's title.
 pub fn show<R>(
     ui: &mut egui::Ui,
     export: &mut PlotExportQueue,
     id_source: &str,
     title: &str,
+    height: f32,
+    header_rect: Option<egui::Rect>,
     plot: egui_plot::Plot<'_>,
     build_fn: impl FnOnce(&mut egui_plot::PlotUi) -> R,
 ) -> R {
+    // Grid line
+    let plot = plot.grid_spacing(8.0..=9.0);
     let plot = if export.zoom_to_fit.remove(id_source) { plot.reset() } else { plot };
+    let pos = ui.available_rect_before_wrap().min;
+    let size = egui::vec2(ui.available_size_before_wrap().x.max(64.0), height.max(64.0));
+    let plot_rect = egui::Rect::from_min_size(pos, size);
+    let full_rect = match header_rect {
+        Some(header_rect) => header_rect.union(plot_rect),
+        None => plot_rect,
+    };
 
-    // Mutated in place (not via `ui.scope`, which would parent the plot under
-    // a fresh auto-id `Ui` and change what `ui.make_persistent_id(id_source)`
-    // resolves to inside `Plot::show`, orphaning any saved pan/zoom state) and
-    // restored right after, since callers keep drawing on this same `ui`
-    // (e.g. the stats label below `histogram_plot_sized`'s plot) and
-    // shouldn't inherit the plot-only background/text color.
-    //
-    // `override_text_color` goes along with it: egui_plot draws axis tick
-    // labels and the background grid from `ui.visuals().text_color()`
-    // (see `color_from_strength`), which defaults to a light color for this
-    // app's dark theme - unreadable against a white plot background.
     let old_bg = ui.visuals().extreme_bg_color;
     let old_text = ui.visuals().override_text_color;
     ui.visuals_mut().extreme_bg_color = egui::Color32::WHITE;
-    ui.visuals_mut().override_text_color = Some(egui::Color32::BLACK);
+    ui.visuals_mut().override_text_color = Some(PLOT_TEXT_COLOR);
     let response = plot.show(ui, build_fn);
     ui.visuals_mut().extreme_bg_color = old_bg;
     ui.visuals_mut().override_text_color = old_text;
 
-    let rect = response.response.rect;
+    let rect = full_rect;
 
     response.response.context_menu(|ui| {
         if ui.button("Save image as...").clicked() {
@@ -165,7 +157,7 @@ pub fn show<R>(
     response.inner
 }
 
-/// Crops a full-window screenshot (in physical pixels) down to `rect`
+/// Crops a screenshot (in physical pixels) down to `rect`
 /// (in points), converting via `pixels_per_point`.
 fn crop(image: &egui::ColorImage, rect: egui::Rect, ppp: f32) -> egui::ColorImage {
     let [img_w, img_h] = image.size;

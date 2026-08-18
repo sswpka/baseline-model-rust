@@ -1,10 +1,4 @@
-//! Direct transcription of the pure accumulation logic in
-//! `Presentation/ViewModels/Calibration/CalibrationViewModel.DataProcessing.cs`.
-//! `hex_data` here is an array of 2-hex-char byte strings (as produced by
-//! `split_hex_data`), so offsets are in byte units - consistent with
-//! `BaselineFileService`'s char-offset 36 == byte-offset 18 for the same
-//! L1/L2 field (see `io::baseline_file_service`'s offset test).
-
+//! Accumulation logic for Calibration mode's per-channel histograms.
 const VOLTAGE_SCALE: f64 = (5.0 / 16383.0) * 1000.0;
 
 #[derive(Debug, Clone, Default)]
@@ -33,34 +27,32 @@ impl CalibrationAccumulator {
         }
     }
 
-    /// Matches `ProcessCalibration`. `hex_data` is byte-pair strings, not raw hex chars.
     pub fn process_calibration(&mut self, hex_data: &[String]) {
         if hex_data.len() < 18 {
             return;
         }
 
         for i in 0..11usize {
-            let offset_l1l2 = 18 + 64 * i;
-            let offset_l6l7 = 722 + 64 * i;
+            let offset = 18 + 128 * i;
 
-            if offset_l1l2 + 64 > hex_data.len() || offset_l6l7 + 64 > hex_data.len() {
+            if offset + 128 > hex_data.len() {
                 continue;
             }
 
             for j in 0..16usize {
-                let l1_val = parse_hex_pair(hex_data, offset_l1l2 + j * 2);
+                let l1_val = parse_hex_pair(hex_data, offset + j * 2);
                 self.l1_columns[j].push(l1_val);
                 self.l1_volt_columns[j].push(l1_val * VOLTAGE_SCALE);
 
-                let l2_val = parse_hex_pair(hex_data, offset_l1l2 + 32 + j * 2);
+                let l2_val = parse_hex_pair(hex_data, offset + 32 + j * 2);
                 self.l2_columns[j].push(l2_val);
                 self.l2_volt_columns[j].push(l2_val * VOLTAGE_SCALE);
 
-                let l6_val = parse_hex_pair(hex_data, offset_l6l7 + j * 2);
+                let l6_val = parse_hex_pair(hex_data, offset + 64 + j * 2);
                 self.l6_columns[j].push(l6_val);
                 self.l6_volt_columns[j].push(l6_val * VOLTAGE_SCALE);
 
-                let l7_val = parse_hex_pair(hex_data, offset_l6l7 + 32 + j * 2);
+                let l7_val = parse_hex_pair(hex_data, offset + 96 + j * 2);
                 self.l7_columns[j].push(l7_val);
                 self.l7_volt_columns[j].push(l7_val * VOLTAGE_SCALE);
             }

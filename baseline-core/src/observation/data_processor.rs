@@ -66,7 +66,7 @@ pub const LINE_TAIL_FIELDS: &[LineTailField] = &[
 ];
 
 /// Formular decode for FEE2 Temperature and the BGO bias/temperature fields.
-fn formula_decode(x: f64) -> f64 {
+pub(crate) fn formula_decode(x: f64) -> f64 {
     65.17 * (x * 4096.0 / 3.3).powf(0.1401) - 141.6
 }
 

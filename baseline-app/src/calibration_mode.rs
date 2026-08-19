@@ -12,9 +12,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use crate::channel::{channel_block_ui, ChannelState};
 use crate::fit_overlay::{self, FitOverlayFlags};
 
-<<<<<<< Updated upstream
-#[derive()]
-=======
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalibrationTab {
     ChannelView,
@@ -155,7 +152,6 @@ fn csv_field(value: &str) -> String {
     }
 }
 
->>>>>>> Stashed changes
 enum WorkerMsg {
     Status(String, Color32),
     Busy(bool),

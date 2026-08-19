@@ -1,9 +1,14 @@
 //! Port of Baseline mode: Running file I/O, Excel, per-channel fits runs on a
 //! background thread and reports back over an `mpsc` channel
 
+use baseline_core::baseline_data_table::{parse_baseline_line, BaselineLineResult, BASELINE_TAIL_FIELDS};
 use baseline_core::io;
+use baseline_core::io::segment_filter::filter_e225_segments_from_files;
 use baseline_core::math::MathService;
 use baseline_core::models::baseline::BaselineData;
+use baseline_core::models::shared::AppConstants;
+use baseline_core::observation::data_processor::split_hex_data;
+use chrono::{DateTime, Utc};
 use egui::Color32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -11,7 +16,152 @@ use std::sync::mpsc::{Receiver, Sender};
 use crate::channel::{channel_block_ui, ChannelState};
 use crate::fit_overlay::{self, FitOverlayFlags};
 
-pub enum WorkerMsg {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineTab {
+    ChannelView,
+    DataTable,
+}
+
+/// One decoded raw line for the Data Table tab. Each of the 16
+/// Data-Acquisition blocks per layer (L1/L2/L6/L7) is its own cell, holding
+#[derive(Debug, Clone)]
+struct BaselineRow {
+    packet_sync: String,
+    package_id: i32,
+    packet_sequence: i32,
+    packet_data_length: i32,
+    time: DateTime<Utc>,
+    data_type: String,
+    sample_index: i32,
+    l1_blocks: Vec<String>,
+    l2_blocks: Vec<String>,
+    l6_blocks: Vec<String>,
+    l7_blocks: Vec<String>,
+    /// Values for `BASELINE_TAIL_FIELDS`, in that same order.
+    tail: Vec<String>,
+    reserved_hex: String,
+    checksum_hex: String,
+}
+
+impl From<BaselineLineResult> for BaselineRow {
+    fn from(r: BaselineLineResult) -> Self {
+        Self {
+            packet_sync: r.packet_sync,
+            package_id: r.package_id,
+            packet_sequence: r.packet_sequence,
+            packet_data_length: r.packet_data_length,
+            time: r.time,
+            data_type: r.data_type,
+            sample_index: r.sample_index,
+            l1_blocks: r.l1_blocks,
+            l2_blocks: r.l2_blocks,
+            l6_blocks: r.l6_blocks,
+            l7_blocks: r.l7_blocks,
+            tail: r.tail,
+            reserved_hex: r.reserved_hex,
+            checksum_hex: r.checksum_hex,
+        }
+    }
+}
+
+/// "YYYY-MM-DD HH:MM:SS.mmm", matching Calibration/Observation mode's Data Table.
+fn format_event_time(time: DateTime<Utc>) -> String {
+    time.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+const TIME_SAMPLE_TEXT: &str = "0000-00-00 00:00:00.000";
+
+/// Rendered pixel width of `text` in the current `Body` text style
+fn text_render_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    ui.fonts(|f| f.layout_no_wrap(text.to_string(), font_id, Color32::WHITE).size().x)
+}
+
+/// Fits the Data Table's column widths to their content
+fn header_column_width(ui: &egui::Ui, header: &str) -> f32 {
+    const PADDING: f32 = 20.0;
+    const MIN_WIDTH: f32 = 60.0;
+    const BLOCK_MIN_WIDTH: f32 = 220.0;
+    const RESERVED_MIN_WIDTH: f32 = 900.0;
+    let mut text_width = text_render_width(ui, header);
+    if header.starts_with("Time ") {
+        text_width = text_width.max(text_render_width(ui, TIME_SAMPLE_TEXT));
+    }
+    let min_width = if header.contains("Data Acquisition") {
+        BLOCK_MIN_WIDTH
+    } else if header.starts_with("Reserved") {
+        RESERVED_MIN_WIDTH
+    } else {
+        MIN_WIDTH
+    };
+    (text_width + PADDING).max(min_width)
+}
+
+/// Byte range label for the `index`'th (0-based) Data Acquisition block
+/// within a layer whose first sample starts at `layer_base`.
+fn block_byte_range(layer_base: usize, index: usize) -> (usize, usize) {
+    use baseline_core::baseline_data_table::{sample_block_offset, BLOCK_LEN};
+    let start = sample_block_offset(layer_base, index);
+    (start, start + BLOCK_LEN - 1)
+}
+
+/// Header labels for the Data Table tab and its CSV export, in column order.
+fn baseline_table_headers() -> Vec<String> {
+    use baseline_core::baseline_data_table::{BLOCKS_PER_LAYER, L1_OFFSET, L2_OFFSET, L6_OFFSET, L7_OFFSET};
+    let mut headers = vec![
+        "Packet Sync Code (Byte 0-1)".to_string(),
+        "Package ID (Byte 2-3)".to_string(),
+        "Packet Seq (Byte 4-5)".to_string(),
+        "Packet Data Len (Byte 6-7)".to_string(),
+        "Time (Byte 8-13)".to_string(),
+        "Data Type (Byte 14-15)".to_string(),
+        "Sample Index (Byte 16-17)".to_string(),
+    ];
+    for (layer, offset) in [("L1", L1_OFFSET), ("L2", L2_OFFSET), ("L6", L6_OFFSET), ("L7", L7_OFFSET)] {
+        for i in 0..BLOCKS_PER_LAYER {
+            let (start, end) = block_byte_range(offset, i);
+            headers.push(format!("{layer} Data Acquisition-{} (Byte {start}-{end})", i + 1));
+        }
+    }
+    for field in BASELINE_TAIL_FIELDS {
+        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 1));
+    }
+    headers.push("Reserved (Byte 1958-2061)".to_string());
+    headers.push("Checksum (Byte 2062-2063)".to_string());
+    headers
+}
+
+/// One row's cells for the Data Table tab and its CSV export
+fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
+    let mut cells = vec![
+        row.packet_sync.clone(),
+        row.package_id.to_string(),
+        row.packet_sequence.to_string(),
+        row.packet_data_length.to_string(),
+        format_event_time(row.time),
+        row.data_type.clone(),
+        row.sample_index.to_string(),
+    ];
+    for blocks in [&row.l1_blocks, &row.l2_blocks, &row.l6_blocks, &row.l7_blocks] {
+        cells.extend(blocks.iter().cloned());
+    }
+    cells.extend(row.tail.iter().cloned());
+    cells.push(row.reserved_hex.clone());
+    cells.push(row.checksum_hex.clone());
+    cells
+}
+
+/// Quotes a CSV field if it contains a comma, quote, or newline (the
+/// Data Acquisition block cells always do, being comma-joined lists).
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+enum WorkerMsg {
     Status(String, Color32),
     Progress(f64),
     Busy(bool),
@@ -25,6 +175,7 @@ pub enum WorkerMsg {
         stop: String,
         duration: String,
     },
+    TableRows(Vec<BaselineRow>),
     Error(String),
 }
 
@@ -90,6 +241,10 @@ pub struct BaselineMode {
 
     channels: Vec<ChannelState>,
 
+    active_tab: BaselineTab,
+    /// Data Table tab
+    rows: Vec<BaselineRow>,
+
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
 }
@@ -138,6 +293,8 @@ impl Default for BaselineMode {
             header_info_text: String::new(),
             can_save_mean: false,
             channels,
+            active_tab: BaselineTab::ChannelView,
+            rows: Vec::new(),
             tx,
             rx,
         }
@@ -175,13 +332,24 @@ impl BaselineMode {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let (x_channels, z_channels) = self.channels.split_at_mut(8);
-                ui.columns(2, |columns| {
-                    channel_block_ui(&mut columns[0], "X-direction (CH 1-8)", x_channels, export);
-                    channel_block_ui(&mut columns[1], "Z-direction (CH 9-16)", z_channels, export);
-                });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, BaselineTab::ChannelView, "Channel View");
+                ui.selectable_value(&mut self.active_tab, BaselineTab::DataTable, "Data Table");
             });
+            ui.separator();
+
+            match self.active_tab {
+                BaselineTab::ChannelView => {
+                    egui::ScrollArea::vertical().id_salt("baseline_channel_scroll").show(ui, |ui| {
+                        let (x_channels, z_channels) = self.channels.split_at_mut(8);
+                        ui.columns(2, |columns| {
+                            channel_block_ui(&mut columns[0], "X-direction (CH 1-8)", x_channels, export);
+                            channel_block_ui(&mut columns[1], "Z-direction (CH 9-16)", z_channels, export);
+                        });
+                    });
+                }
+                BaselineTab::DataTable => self.data_table_ui(ui),
+            }
         });
 
         if self.is_busy {
@@ -220,6 +388,7 @@ impl BaselineMode {
                     self.duration_str = duration;
                     self.can_save_mean = true;
                 }
+                WorkerMsg::TableRows(rows) => self.rows = rows,
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.status_color = Color32::RED;
@@ -247,6 +416,15 @@ impl BaselineMode {
                 .clicked()
             {
                 self.check_header();
+            }
+            if ui
+                .add_enabled(
+                    !self.is_busy && !self.selected_files.is_empty(),
+                    egui::Button::new("Read Data Table"),
+                )
+                .clicked()
+            {
+                self.read_data_table();
             }
         });
 
@@ -467,6 +645,7 @@ impl BaselineMode {
         self.input_files_info = "No files selected".to_string();
         self.processed_data.clear();
         self.data_counts_str = "-".to_string();
+        self.rows.clear();
         for (i, ch) in self.channels.iter_mut().enumerate() {
             *ch = ChannelState {
                 channel_index: i,
@@ -538,6 +717,13 @@ impl BaselineMode {
         self.progress_value = 0.0;
         self.status_message = "Processing...".to_string();
         self.can_save_mean = false;
+        self.rows.clear();
+
+        if !self.selected_files.is_empty() {
+            let files = self.selected_files.clone();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || read_data_table_worker(files, tx));
+        }
 
         let output_dir = self.output_directory_path.clone();
         let output_file_name = self.output_file_name.clone();
@@ -617,6 +803,82 @@ impl BaselineMode {
         let k_factor = self.k_factor;
         let tx = self.tx.clone();
         std::thread::spawn(move || check_header_worker(file_path, delay_time_ms, k_factor, tx));
+    }
+
+    fn read_data_table(&mut self) {
+        if self.selected_files.is_empty() {
+            self.status_message = "Please select files first.".to_string();
+            return;
+        }
+        self.is_busy = true;
+        self.progress_value = 0.0;
+        self.rows.clear();
+        self.status_message = "Reading data table...".to_string();
+        self.status_color = Color32::from_rgb(255, 165, 0);
+
+        let files = self.selected_files.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || read_data_table_worker(files, tx));
+    }
+
+    /// Data Table tab: one row per raw line, decoded per `Baseline.txt`.
+    fn data_table_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.rows.is_empty(), egui::Button::new("Export Table as CSV...")).clicked() {
+                self.export_table_csv();
+            }
+            ui.label(format!("{} row(s)", self.rows.len()));
+        });
+        ui.separator();
+
+        let headers = baseline_table_headers();
+        let widths: Vec<f32> = headers.iter().map(|h| header_column_width(ui, h)).collect();
+
+        egui::ScrollArea::horizontal().id_salt("baseline_data_table_hscroll").show(ui, |ui| {
+            let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+
+            egui::Grid::new("baseline_data_table_header").show(ui, |ui| {
+                for (header, &width) in headers.iter().zip(&widths) {
+                    ui.add_sized([width, row_height], egui::Label::new(egui::RichText::new(header).strong()).truncate());
+                }
+                ui.end_row();
+            });
+
+            egui::ScrollArea::vertical().id_salt("baseline_data_table_vscroll").show_rows(ui, row_height, self.rows.len(), |ui, visible_range| {
+                egui::Grid::new("baseline_data_table_body").striped(true).start_row(visible_range.start).show(ui, |ui| {
+                    for row in &self.rows[visible_range] {
+                        let cells = baseline_row_cells(row);
+                        for (cell, &width) in cells.iter().zip(&widths) {
+                            ui.add_sized([width, row_height], egui::Label::new(cell).truncate());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Export the data table as CSV
+    fn export_table_csv(&mut self) {
+        if self.rows.is_empty() {
+            self.status_message = "No rows to export - run Read Data Table first.".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().set_file_name("baseline_table.csv").add_filter("CSV", &["csv"]).save_file() else {
+            return;
+        };
+
+        let mut csv = baseline_table_headers().iter().map(|h| csv_field(h)).collect::<Vec<_>>().join(",");
+        csv.push('\n');
+        for row in &self.rows {
+            csv.push_str(&baseline_row_cells(row).iter().map(|c| csv_field(c)).collect::<Vec<_>>().join(","));
+            csv.push('\n');
+        }
+
+        match std::fs::write(&path, csv) {
+            Ok(()) => self.status_message = format!("Exported {} row(s) to {}", self.rows.len(), path.display()),
+            Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
+        }
     }
 }
 
@@ -1022,6 +1284,55 @@ fn save_mean_worker(data: Vec<BaselineData>, output_dir: PathBuf, tx: Sender<Wor
         "Mean Values Saved Successfully.".to_string(),
         Color32::from_rgb(50, 200, 50),
     ));
+    let _ = tx.send(WorkerMsg::Busy(false));
+}
+
+fn read_data_table_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
+    let segments = match filter_e225_segments_from_files(&files, AppConstants::SEGMENT_HEX_LENGTH) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!("Error: {e}")));
+            let _ = tx.send(WorkerMsg::Busy(false));
+            return;
+        }
+    };
+
+    if segments.is_empty() {
+        let _ = tx.send(WorkerMsg::Status(
+            "No valid E225 segments found.".to_string(),
+            Color32::RED,
+        ));
+        let _ = tx.send(WorkerMsg::Busy(false));
+        return;
+    }
+
+    let total = segments.len();
+    let mut table_rows: Vec<BaselineRow> = Vec::with_capacity(total);
+
+    for (index, segment) in segments.iter().enumerate() {
+        let hex_data = split_hex_data(segment);
+
+        if let Some(line) = parse_baseline_line(&hex_data) {
+            table_rows.push(line.into());
+        }
+
+        if index % 1000 == 0 {
+            let progress = (index as f64 / total.max(1) as f64) * 100.0;
+            let _ = tx.send(WorkerMsg::Progress(progress));
+            let _ = tx.send(WorkerMsg::Status(
+                format!("Reading data table: {}/{} segments", index, total),
+                Color32::GRAY,
+            ));
+        }
+    }
+
+    let row_count = table_rows.len();
+    let _ = tx.send(WorkerMsg::TableRows(table_rows));
+    let _ = tx.send(WorkerMsg::Status(
+        format!("Data table ready: {row_count} row(s)."),
+        Color32::from_rgb(50, 200, 50),
+    ));
+    let _ = tx.send(WorkerMsg::Progress(100.0));
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 

@@ -1,6 +1,9 @@
 //! Port of Calibration mode
 
-use baseline_core::calibration::{parse_calibration_line, CalibrationAccumulator, CalibrationLineResult, CALIBRATION_TAIL_FIELDS};
+use baseline_core::calibration::{
+    calibration_block_fields, parse_calibration_line, CalibrationAccumulator, CalibrationLineResult,
+    CALIBRATION_TAIL_FIELDS,
+};
 use baseline_core::io;
 use baseline_core::math::MathService;
 use baseline_core::observation::data_processor::{split_hex_data, validate_header};
@@ -18,9 +21,9 @@ enum CalibrationTab {
     DataTable,
 }
 
-/// One decoded raw line for the Data Table tab. Voltage-step values are
-/// pre-joined into a single comma-separated cell per layer (L1/L2/L6/L7),
-/// each holding 11 raw 32-byte hex blocks, one per voltage step (0.0V-1.0V),
+/// One decoded raw line for the Data Table tab. Each of the 44 block columns
+/// (11 voltage steps x 4 layers L1/L2/L6/L7, matching `calibration_block_fields`)
+/// is pre-joined into a single comma-separated cell of its 16 decoded decimal values.
 #[derive(Debug, Clone)]
 struct CalibrationRow {
     packet_sync: String,
@@ -30,18 +33,15 @@ struct CalibrationRow {
     time: DateTime<Utc>,
     data_type: String,
     sample_index: i32,
-    l1_values: String,
-    l2_values: String,
-    l6_values: String,
-    l7_values: String,
+    blocks: Vec<String>,
     /// Values for `CALIBRATION_TAIL_FIELDS`, in that same order.
     tail: Vec<String>,
     reserved_hex: String,
     checksum_hex: String,
 }
 
-fn join_values(values: &[String]) -> String {
-    values.join(", ")
+fn join_i32_values(values: &[i32]) -> String {
+    values.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
 }
 
 impl From<CalibrationLineResult> for CalibrationRow {
@@ -54,10 +54,7 @@ impl From<CalibrationLineResult> for CalibrationRow {
             time: r.time,
             data_type: r.data_type,
             sample_index: r.sample_index,
-            l1_values: join_values(&r.l1_values),
-            l2_values: join_values(&r.l2_values),
-            l6_values: join_values(&r.l6_values),
-            l7_values: join_values(&r.l7_values),
+            blocks: r.blocks.iter().map(|b| join_i32_values(b)).collect(),
             tail: r.tail,
             reserved_hex: r.reserved_hex,
             checksum_hex: r.checksum_hex,
@@ -82,13 +79,13 @@ fn text_render_width(ui: &egui::Ui, text: &str) -> f32 {
 fn header_column_width(ui: &egui::Ui, header: &str) -> f32 {
     const PADDING: f32 = 20.0;
     const MIN_WIDTH: f32 = 60.0;
-    const LIST_MIN_WIDTH: f32 = 700.0;
+    const LIST_MIN_WIDTH: f32 = 260.0;
     const RESERVED_MIN_WIDTH: f32 = 900.0;
     let mut text_width = text_render_width(ui, header);
     if header.starts_with("Time ") {
         text_width = text_width.max(text_render_width(ui, TIME_SAMPLE_TEXT));
     }
-    let min_width = if header.contains("Values") {
+    let min_width = if header.contains("V L") {
         LIST_MIN_WIDTH
     } else if header.starts_with("Reserved") {
         RESERVED_MIN_WIDTH
@@ -108,11 +105,10 @@ fn calibration_table_headers() -> Vec<String> {
         "Time (Byte 8-13)".to_string(),
         "Data Type (Byte 14-15)".to_string(),
         "Sample Index (Byte 16-17)".to_string(),
-        "L1 Values, 0.0-1.0V raw 32B blocks".to_string(),
-        "L2 Values, 0.0-1.0V raw 32B blocks".to_string(),
-        "L6 Values, 0.0-1.0V raw 32B blocks".to_string(),
-        "L7 Values, 0.0-1.0V raw 32B blocks".to_string(),
     ];
+    for field in calibration_block_fields() {
+        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 31));
+    }
     for field in CALIBRATION_TAIL_FIELDS {
         headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 1));
     }
@@ -131,19 +127,16 @@ fn calibration_row_cells(row: &CalibrationRow) -> Vec<String> {
         format_event_time(row.time),
         row.data_type.clone(),
         row.sample_index.to_string(),
-        row.l1_values.clone(),
-        row.l2_values.clone(),
-        row.l6_values.clone(),
-        row.l7_values.clone(),
     ];
+    cells.extend(row.blocks.iter().cloned());
     cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
     cells.push(row.checksum_hex.clone());
     cells
 }
 
-/// Quotes a CSV field if it contains a comma, quote, or newline (the
-/// L1/L2/L6/L7 value-list cells always do, being comma-joined lists).
+/// Quotes a CSV field if it contains a comma, quote, or newline (the 44
+/// block-column cells always do, being comma-joined lists of 16 values).
 fn csv_field(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -508,10 +501,13 @@ impl CalibrationMode {
                 .cloned()
                 .collect()
         } else {
-            match io::file_helper::find_excel_file(&self.output_file_name) {
+            match io::file_helper::find_excel_file(&self.output_file_name, "Calibration") {
                 Some(f) => vec![f],
                 None => {
-                    self.status_message = format!("File not found: {}.xlsx", self.output_file_name);
+                    self.status_message = format!(
+                        "File not found: {}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)",
+                        self.output_file_name
+                    );
                     self.is_busy = false;
                     return;
                 }
@@ -657,7 +653,7 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
                 format!("Saving {} segments to Excel...", segments.len()),
                 Color32::GRAY,
             ));
-            match io::file_helper::resolve_excel_save_path(&output_name, "") {
+            match io::file_helper::resolve_excel_save_path(&output_name, "Calibration") {
                 Ok(path) => match io::excel::save_lines_to_excel(&segments, &path) {
                     Ok(()) => {
                         let _ = tx.send(WorkerMsg::Status(

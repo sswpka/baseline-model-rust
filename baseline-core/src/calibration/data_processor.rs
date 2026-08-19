@@ -37,10 +37,39 @@ const L2_LAYER_OFFSET: usize = 32;
 const L6_LAYER_OFFSET: usize = 64;
 const L7_LAYER_OFFSET: usize = 96;
 
+/// Layer names in on-wire order within each voltage step's 128-byte block.
+const LAYER_NAMES: [(&str, usize); 4] = [
+    ("L1", L1_LAYER_OFFSET),
+    ("L2", L2_LAYER_OFFSET),
+    ("L6", L6_LAYER_OFFSET),
+    ("L7", L7_LAYER_OFFSET),
+];
+
 const RESERVED_START: usize = 1446;
 const RESERVED_LEN: usize = 616; // Byte 1446-2061
 const CHECKSUM_START: usize = 2062;
 const CHECKSUM_LEN: usize = 2; // Byte 2062-2063
+
+/// One decoded 32-byte block column (e.g. "0.0V L1"): 16 values, 2 bytes
+/// each, decoded to decimal.
+pub struct CalibrationBlockField {
+    pub label: String,
+    pub byte_start: usize,
+}
+
+/// Byte 18-1425: 44 columns (11 voltage steps x 4 layers L1/L2/L6/L7, in
+/// that order within each step), one label + byte offset per 32-byte block.
+pub fn calibration_block_fields() -> Vec<CalibrationBlockField> {
+    (0..VOLTAGE_STEPS)
+        .flat_map(|step| {
+            let voltage = step as f64 * 0.1;
+            LAYER_NAMES.iter().map(move |&(name, layer_offset)| CalibrationBlockField {
+                label: format!("{:.1}V {}", voltage, name),
+                byte_start: BLOCK_START + STEP_STRIDE * step + layer_offset,
+            })
+        })
+        .collect()
+}
 
 /// One decoded raw line for the Calibration mode Data Table tab.
 #[derive(Debug, Clone, Default)]
@@ -52,10 +81,9 @@ pub struct CalibrationLineResult {
     pub time: DateTime<Utc>,
     pub data_type: String,
     pub sample_index: i32,
-    pub l1_values: Vec<String>,
-    pub l2_values: Vec<String>,
-    pub l6_values: Vec<String>,
-    pub l7_values: Vec<String>,
+    /// 44 columns (11 voltage steps x 4 layers, matching `calibration_block_fields`),
+    /// each holding 16 decoded decimal values.
+    pub blocks: Vec<Vec<i32>>,
     /// Decoded values for `CALIBRATION_TAIL_FIELDS`, in that same order.
     pub tail: Vec<String>,
     pub reserved_hex: String,
@@ -74,16 +102,9 @@ fn hex_span(hex_data: &[String], start: usize, len: usize) -> String {
     (start..start + len).map(|i| hex_data.get(i).cloned().unwrap_or_else(|| "00".to_string())).collect()
 }
 
-/// 11 voltage steps' raw 32-byte blocks for one layer, reading step-major:
-/// within each step's 128-byte block, `layer_offset` selects that layer's
-/// 32-byte sub-block (`L1_LAYER_OFFSET`/`L2_LAYER_OFFSET`/`L6_LAYER_OFFSET`/`L7_LAYER_OFFSET`).
-fn layer_values(hex_data: &[String], layer_offset: usize) -> Vec<String> {
-    (0..VOLTAGE_STEPS)
-        .map(|step| {
-            let offset = BLOCK_START + STEP_STRIDE * step + layer_offset;
-            hex_span(hex_data, offset, BLOCK_LEN)
-        })
-        .collect()
+/// Decodes one 32-byte block into 16 decimal values, 2 bytes each.
+fn decode_block(hex_data: &[String], byte_start: usize) -> Vec<i32> {
+    (0..BLOCK_LEN / 2).map(|j| dec_pair(hex_data, byte_start + j * 2)).collect()
 }
 
 /// Decodes one raw calibration line into a Data Table row.
@@ -94,6 +115,14 @@ pub fn parse_calibration_line(hex_data: &[String]) -> Option<CalibrationLineResu
     let header = parse_line_header_fields(hex_data)?;
     let time = get_date_time_from_hex_data(hex_data).ok()?;
     let sample_index = dec_pair(hex_data, 16);
+
+    let mut blocks = Vec::with_capacity(VOLTAGE_STEPS * LAYER_NAMES.len());
+    for step in 0..VOLTAGE_STEPS {
+        for &(_, layer_offset) in LAYER_NAMES.iter() {
+            let byte_start = BLOCK_START + STEP_STRIDE * step + layer_offset;
+            blocks.push(decode_block(hex_data, byte_start));
+        }
+    }
 
     let tail = CALIBRATION_TAIL_FIELDS
         .iter()
@@ -115,10 +144,7 @@ pub fn parse_calibration_line(hex_data: &[String]) -> Option<CalibrationLineResu
         time,
         data_type: header.data_type,
         sample_index,
-        l1_values: layer_values(hex_data, L1_LAYER_OFFSET),
-        l2_values: layer_values(hex_data, L2_LAYER_OFFSET),
-        l6_values: layer_values(hex_data, L6_LAYER_OFFSET),
-        l7_values: layer_values(hex_data, L7_LAYER_OFFSET),
+        blocks,
         tail,
         reserved_hex: hex_span(hex_data, RESERVED_START, RESERVED_LEN),
         checksum_hex: hex_span(hex_data, CHECKSUM_START, CHECKSUM_LEN),

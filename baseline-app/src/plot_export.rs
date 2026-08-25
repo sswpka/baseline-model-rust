@@ -1,13 +1,9 @@
-//! Function for handling the Right-click "image" menu for `egui_plot::Plot`s, shared by every mode: Save image as..., Copy image, Zoom to fit data, Open image in new window.
-//! Screenshot captures the whole native window
+//! Function for handling the Right-click "image" menu for `egui_plot
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 
 use egui_plot::AxisHints;
-
-/// Color for axis titles, tick numbers, and grid lines
-const PLOT_TEXT_COLOR: egui::Color32 = egui::Color32::LIGHT_GRAY;
 
 /// X-axis hint with a fixed label and a fade range narrow enough that tick
 /// numbers are effectively always at full opacity instead of fading in/out
@@ -15,7 +11,7 @@ pub fn x_axis(label: impl Into<egui::WidgetText>) -> AxisHints<'static> {
     AxisHints::new_x().label(label).label_spacing(60.0..=61.0)
 }
 
-/// Same as `x_axis`, for the Y axis
+/// For the Y axis, same as x_axis
 pub fn y_axis(label: impl Into<egui::WidgetText>) -> AxisHints<'static> {
     AxisHints::new_y().label(label).label_spacing(20.0..=21.0)
 }
@@ -49,7 +45,9 @@ pub struct PlotExportQueue {
 
 impl PlotExportQueue {
     pub fn process_screenshot(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending.take() else { return };
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
 
         let image = ctx.input(|i| {
             i.events.iter().find_map(|e| match e {
@@ -81,10 +79,15 @@ impl PlotExportQueue {
         self.open_windows.retain(|w| {
             ctx.show_viewport_immediate(
                 w.id,
-                egui::ViewportBuilder::default().with_title(&w.title).with_inner_size(w.size),
+                egui::ViewportBuilder::default()
+                    .with_title(&w.title)
+                    .with_inner_size(w.size),
                 |ctx, _class| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.add(egui::Image::new((w.texture.id(), w.texture.size_vec2())).fit_to_exact_size(w.size));
+                        ui.add(
+                            egui::Image::new((w.texture.id(), w.texture.size_vec2()))
+                                .fit_to_exact_size(w.size),
+                        );
                     });
                     !ctx.input(|i| i.viewport().close_requested())
                 },
@@ -92,12 +95,27 @@ impl PlotExportQueue {
         });
     }
 
-    fn open_window(&mut self, ctx: &egui::Context, image: &egui::ColorImage, title: &str, ppp: f32) {
+    fn open_window(
+        &mut self,
+        ctx: &egui::Context,
+        image: &egui::ColorImage,
+        title: &str,
+        ppp: f32,
+    ) {
         self.next_window_id += 1;
         let id = egui::ViewportId::from_hash_of(("plot_export_window", self.next_window_id));
-        let texture = ctx.load_texture(format!("plot_export_{}", self.next_window_id), image.clone(), egui::TextureOptions::default());
+        let texture = ctx.load_texture(
+            format!("plot_export_{}", self.next_window_id),
+            image.clone(),
+            egui::TextureOptions::default(),
+        );
         let size = egui::vec2(image.size[0] as f32, image.size[1] as f32) / ppp;
-        self.open_windows.push(OpenImageWindow { id, title: title.to_string(), texture, size });
+        self.open_windows.push(OpenImageWindow {
+            id,
+            title: title.to_string(),
+            texture,
+            size,
+        });
     }
 }
 
@@ -113,7 +131,11 @@ pub fn show<R>(
 ) -> R {
     // Grid line
     let plot = plot.grid_spacing(8.0..=9.0);
-    let plot = if export.zoom_to_fit.remove(id_source) { plot.reset() } else { plot };
+    let plot = if export.zoom_to_fit.remove(id_source) {
+        plot.reset()
+    } else {
+        plot
+    };
     let pos = ui.available_rect_before_wrap().min;
     let size = egui::vec2(ui.available_size_before_wrap().x.max(64.0), height.max(64.0));
     let plot_rect = egui::Rect::from_min_size(pos, size);
@@ -121,11 +143,11 @@ pub fn show<R>(
         Some(header_rect) => header_rect.union(plot_rect),
         None => plot_rect,
     };
-
+    
     let old_bg = ui.visuals().extreme_bg_color;
     let old_text = ui.visuals().override_text_color;
-    ui.visuals_mut().extreme_bg_color = egui::Color32::WHITE;
-    ui.visuals_mut().override_text_color = Some(PLOT_TEXT_COLOR);
+    ui.visuals_mut().extreme_bg_color = egui::Color32::BLACK;
+    ui.visuals_mut().override_text_color = Some(egui::Color32::DARK_GRAY);
     let response = plot.show(ui, build_fn);
     ui.visuals_mut().extreme_bg_color = old_bg;
     ui.visuals_mut().override_text_color = old_text;
@@ -134,13 +156,23 @@ pub fn show<R>(
 
     response.response.context_menu(|ui| {
         if ui.button("Save image as...").clicked() {
-            export.pending = Some(PendingExport { rect, action: ExportAction::Save, title: title.to_string() });
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            export.pending = Some(PendingExport {
+                rect,
+                action: ExportAction::Save,
+                title: title.to_string(),
+            });
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Screenshot);
             ui.close_menu();
         }
         if ui.button("Copy image").clicked() {
-            export.pending = Some(PendingExport { rect, action: ExportAction::Copy, title: title.to_string() });
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            export.pending = Some(PendingExport {
+                rect,
+                action: ExportAction::Copy,
+                title: title.to_string(),
+            });
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Screenshot);
             ui.close_menu();
         }
         if ui.button("Zoom to fit data").clicked() {
@@ -148,8 +180,13 @@ pub fn show<R>(
             ui.close_menu();
         }
         if ui.button("Open image in new window").clicked() {
-            export.pending = Some(PendingExport { rect, action: ExportAction::OpenWindow, title: title.to_string() });
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            export.pending = Some(PendingExport {
+                rect,
+                action: ExportAction::OpenWindow,
+                title: title.to_string(),
+            });
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Screenshot);
             ui.close_menu();
         }
     });
@@ -173,7 +210,10 @@ fn crop(image: &egui::ColorImage, rect: egui::Rect, ppp: f32) -> egui::ColorImag
         let row_start = y * img_w + x0;
         pixels.extend_from_slice(&image.pixels[row_start..row_start + w]);
     }
-    egui::ColorImage { size: [w, h], pixels }
+    egui::ColorImage {
+        size: [w, h],
+        pixels,
+    }
 }
 
 fn to_rgba_bytes(image: &egui::ColorImage) -> Vec<u8> {
@@ -185,12 +225,16 @@ fn to_rgba_bytes(image: &egui::ColorImage) -> Vec<u8> {
 }
 
 fn sanitize_filename(name: &str) -> String {
-    name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect()
+    name.chars()
+        .map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
+        .collect()
 }
 
 fn save_image(image: &egui::ColorImage, title: &str) {
-    let Some(path) =
-        rfd::FileDialog::new().set_file_name(format!("{}.png", sanitize_filename(title))).add_filter("PNG Image", &["png"]).save_file()
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name(format!("{}.png", sanitize_filename(title)))
+        .add_filter("PNG Image", &["png"])
+        .save_file()
     else {
         return;
     };
@@ -211,7 +255,11 @@ fn copy_image(image: &egui::ColorImage) {
     let bytes = to_rgba_bytes(image);
     match arboard::Clipboard::new() {
         Ok(mut clipboard) => {
-            let data = arboard::ImageData { width: w, height: h, bytes: Cow::Owned(bytes) };
+            let data = arboard::ImageData {
+                width: w,
+                height: h,
+                bytes: Cow::Owned(bytes),
+            };
             if let Err(e) = clipboard.set_image(data) {
                 eprintln!("Failed to copy plot image to clipboard: {e}");
             }

@@ -1,7 +1,4 @@
-//! Direct transcription of `Infrastructure/Services/FileHelper.cs` (the
-//! subset used by Calibration/Flux/Observation modes: `CombineFilesAsync`,
-//! `SaveToExcelAsync`'s path resolution, `FindExcelFile`). Excel writing
-//! itself is `io::excel::save_lines_to_excel`.
+//! FileHelper
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +12,6 @@ pub fn get_documents_folder() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Matches `GetOutputFolder`: `Documents/DSSD_Analysis/{sub_folder}`, created if missing.
 pub fn get_output_folder(sub_folder: &str) -> std::io::Result<PathBuf> {
     let mut path = get_documents_folder().join(APP_FOLDER_NAME);
     if !sub_folder.is_empty() {
@@ -27,8 +23,6 @@ pub fn get_output_folder(sub_folder: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Matches `CombineFilesAsync`: raw byte concatenation into
-/// `Documents/DSSD_Analysis/CombinedData/{output_file_name}`.
 pub fn combine_files(file_paths: &[PathBuf], output_file_name: &str) -> Result<PathBuf, String> {
     if file_paths.is_empty() {
         return Err("No files selected for combination.".to_string());
@@ -49,10 +43,6 @@ pub fn combine_files(file_paths: &[PathBuf], output_file_name: &str) -> Result<P
     Ok(output_path)
 }
 
-/// Matches `SaveToExcelAsync`'s path-resolution logic (the actual xlsx
-/// writing is `io::excel::save_lines_to_excel`). `file_name` may be a full
-/// rooted path (used as-is) or a bare name (resolved under
-/// `Documents/DSSD_Analysis/{sub_folder or "Source"}`).
 pub fn resolve_excel_save_path(file_name: &str, sub_folder: &str) -> Result<PathBuf, String> {
     let path = Path::new(file_name);
     if path.is_absolute() {
@@ -77,18 +67,24 @@ pub fn resolve_excel_save_path(file_name: &str, sub_folder: &str) -> Result<Path
     Ok(save_dir.join(name))
 }
 
-/// Matches `GetPossibleFilePaths`.
-pub fn get_possible_file_paths(output_name: &str) -> Vec<PathBuf> {
+pub fn get_possible_file_paths(output_name: &str, sub_folder: &str) -> Vec<PathBuf> {
     let documents_base = get_documents_folder().join(APP_FOLDER_NAME);
-    vec![
-        documents_base.join(output_name).join(format!("{output_name}_ParticleData.xlsx")),
-        documents_base.join(SOURCE_FOLDER_NAME).join(format!("{output_name}.xlsx")),
-        documents_base.join(format!("{output_name}.xlsx")),
-    ]
+    let stem = if output_name.to_ascii_lowercase().ends_with(".xlsx") {
+        &output_name[..output_name.len() - ".xlsx".len()]
+    } else {
+        output_name
+    };
+    let folder_name = if sub_folder.trim().is_empty() { SOURCE_FOLDER_NAME } else { sub_folder };
+    let mut candidates = vec![documents_base.join(folder_name).join(format!("{stem}.xlsx"))];
+    if folder_name != SOURCE_FOLDER_NAME {
+        candidates.push(documents_base.join(SOURCE_FOLDER_NAME).join(format!("{stem}.xlsx")));
+    }
+    candidates.push(documents_base.join(stem).join(format!("{stem}_ParticleData.xlsx")));
+    candidates.push(documents_base.join(format!("{stem}.xlsx")));
+    candidates
 }
 
-/// Matches `FindExcelFile`.
-pub fn find_excel_file(output_name: &str) -> Option<PathBuf> {
-    get_possible_file_paths(output_name).into_iter().find(|p| p.exists())
+pub fn find_excel_file(output_name: &str, sub_folder: &str) -> Option<PathBuf> {
+    get_possible_file_paths(output_name, sub_folder).into_iter().find(|p| p.exists())
 }
 

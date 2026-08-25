@@ -1,11 +1,14 @@
-//! Port of Calibration mode (`CalibrationViewModel` + `.Commands.cs` +
-//! `.DataProcessing.cs` + `.Plotting.cs`). Deferred (see project notes):
-//! the per-channel zoom window (`CalibrationDetailWindow`/`OpenZoomWindow`).
+//! Port of Calibration mode
 
-use baseline_core::calibration::CalibrationAccumulator;
+use baseline_core::calibration::{
+    calibration_block_fields, parse_calibration_line, CalibrationAccumulator, CalibrationLineResult,
+    CALIBRATION_TAIL_FIELDS,
+};
 use baseline_core::io;
 use baseline_core::math::MathService;
+use baseline_core::models::shared::AppConstants;
 use baseline_core::observation::data_processor::{split_hex_data, validate_header};
+use chrono::{DateTime, Utc};
 use egui::Color32;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -13,12 +16,143 @@ use std::sync::mpsc::{Receiver, Sender};
 use crate::channel::{channel_block_ui, ChannelState};
 use crate::fit_overlay::{self, FitOverlayFlags};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibrationTab {
+    ChannelView,
+    DataTable,
+}
+
+/// One decoded raw line for the Data Table tab. Each of the 44 block columns
+/// (11 voltage steps x 4 layers L1/L2/L6/L7, matching `calibration_block_fields`)
+/// is pre-joined into a single comma-separated cell of its 16 decoded decimal values.
+#[derive(Debug, Clone)]
+struct CalibrationRow {
+    packet_sync: String,
+    package_id: i32,
+    packet_sequence: i32,
+    packet_data_length: i32,
+    time: DateTime<Utc>,
+    data_type: String,
+    sample_index: i32,
+    blocks: Vec<String>,
+    /// Values for `CALIBRATION_TAIL_FIELDS`, in that same order.
+    tail: Vec<String>,
+    reserved_hex: String,
+    checksum_hex: String,
+}
+
+fn join_i32_values(values: &[i32]) -> String {
+    values.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
+}
+
+impl From<CalibrationLineResult> for CalibrationRow {
+    fn from(r: CalibrationLineResult) -> Self {
+        Self {
+            packet_sync: r.packet_sync,
+            package_id: r.package_id,
+            packet_sequence: r.packet_sequence,
+            packet_data_length: r.packet_data_length,
+            time: r.time,
+            data_type: r.data_type,
+            sample_index: r.sample_index,
+            blocks: r.blocks.iter().map(|b| join_i32_values(b)).collect(),
+            tail: r.tail,
+            reserved_hex: r.reserved_hex,
+            checksum_hex: r.checksum_hex,
+        }
+    }
+}
+
+/// "YYYY-MM-DD HH:MM:SS.mmm", matching Observation mode's Data Table.
+fn format_event_time(time: DateTime<Utc>) -> String {
+    time.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+const TIME_SAMPLE_TEXT: &str = "0000-00-00 00:00:00.000";
+
+/// Rendered pixel width of `text` in the current `Body` text style
+fn text_render_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    ui.fonts(|f| f.layout_no_wrap(text.to_string(), font_id, Color32::WHITE).size().x)
+}
+
+/// Fits the Data Table's column widths to their content
+fn header_column_width(ui: &egui::Ui, header: &str) -> f32 {
+    const PADDING: f32 = 20.0;
+    const MIN_WIDTH: f32 = 60.0;
+    const LIST_MIN_WIDTH: f32 = 260.0;
+    const RESERVED_MIN_WIDTH: f32 = 900.0;
+    let mut text_width = text_render_width(ui, header);
+    if header.starts_with("Time ") {
+        text_width = text_width.max(text_render_width(ui, TIME_SAMPLE_TEXT));
+    }
+    let min_width = if header.contains("V L") {
+        LIST_MIN_WIDTH
+    } else if header.starts_with("Reserved") {
+        RESERVED_MIN_WIDTH
+    } else {
+        MIN_WIDTH
+    };
+    (text_width + PADDING).max(min_width)
+}
+
+/// Header labels for the Data Table tab and its CSV export, in column order.
+fn calibration_table_headers() -> Vec<String> {
+    let mut headers = vec![
+        "Packet Sync Code (Byte 0-1)".to_string(),
+        "Package ID (Byte 2-3)".to_string(),
+        "Packet Seq (Byte 4-5)".to_string(),
+        "Packet Data Len (Byte 6-7)".to_string(),
+        "Time (Byte 8-13)".to_string(),
+        "Data Type (Byte 14-15)".to_string(),
+        "Sample Index (Byte 16-17)".to_string(),
+    ];
+    for field in calibration_block_fields() {
+        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 31));
+    }
+    for field in CALIBRATION_TAIL_FIELDS {
+        headers.push(format!("{} (Byte {}-{})", field.label, field.byte_start, field.byte_start + 1));
+    }
+    headers.push("Reserved (Byte 1446-2061)".to_string());
+    headers.push("Checksum (Byte 2062-2063)".to_string());
+    headers
+}
+
+/// One row's cells for the Data Table tab and its CSV export
+fn calibration_row_cells(row: &CalibrationRow) -> Vec<String> {
+    let mut cells = vec![
+        row.packet_sync.clone(),
+        row.package_id.to_string(),
+        row.packet_sequence.to_string(),
+        row.packet_data_length.to_string(),
+        format_event_time(row.time),
+        row.data_type.clone(),
+        row.sample_index.to_string(),
+    ];
+    cells.extend(row.blocks.iter().cloned());
+    cells.extend(row.tail.iter().cloned());
+    cells.push(row.reserved_hex.clone());
+    cells.push(row.checksum_hex.clone());
+    cells
+}
+
+/// Quotes a CSV field if it contains a comma, quote, or newline (the 44
+/// block-column cells always do, being comma-joined lists of 16 values).
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 enum WorkerMsg {
     Status(String, Color32),
     Busy(bool),
     HeaderCheck(String),
     Progress(f64),
     DataLoaded(CalibrationAccumulator),
+    TableRows(Vec<CalibrationRow>),
     Error(String),
 }
 
@@ -26,9 +160,8 @@ pub struct CalibrationMode {
     input_files: Vec<PathBuf>,
     input_files_info: String,
     output_file_name: String,
-    read_multiple_files: bool,
 
-    selected_layer_index: usize, // 0=L1,1=L2,2=L6,3=L7
+    selected_layer_index: usize,  // 0=L1,1=L2,2=L6,3=L7
     selected_x_axis_index: usize, // 0=ADC,1=Voltage
     x_axis_min: f64,
     x_axis_max: f64,
@@ -49,6 +182,10 @@ pub struct CalibrationMode {
     accumulator: CalibrationAccumulator,
     channels: Vec<ChannelState>,
 
+    active_tab: CalibrationTab,
+    /// Data Table tab
+    rows: Vec<CalibrationRow>,
+
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
 }
@@ -58,8 +195,17 @@ impl Default for CalibrationMode {
         let (tx, rx) = std::sync::mpsc::channel();
         let channels = (0..16)
             .map(|i| {
-                let name = if i < 8 { format!("X{}", i + 1) } else { format!("Z{}", i - 7) };
-                ChannelState { channel_index: i, title: name, stats_text: String::new(), ..Default::default() }
+                let name = if i < 8 {
+                    format!("X{}", i + 1)
+                } else {
+                    format!("Z{}", i - 7)
+                };
+                ChannelState {
+                    channel_index: i,
+                    title: name,
+                    stats_text: String::new(),
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -67,7 +213,6 @@ impl Default for CalibrationMode {
             input_files: Vec::new(),
             input_files_info: "No files selected".to_string(),
             output_file_name: "CalibrationResult".to_string(),
-            read_multiple_files: false,
             selected_layer_index: 0,
             selected_x_axis_index: 0,
             x_axis_min: 0.0,
@@ -85,6 +230,8 @@ impl Default for CalibrationMode {
             math: MathService::new(),
             accumulator: CalibrationAccumulator::default(),
             channels,
+            active_tab: CalibrationTab::ChannelView,
+            rows: Vec::new(),
             tx,
             rx,
         }
@@ -92,7 +239,11 @@ impl Default for CalibrationMode {
 }
 
 impl CalibrationMode {
-    pub fn update(&mut self, ctx: &egui::Context, export: &mut crate::plot_export::PlotExportQueue) {
+    pub fn update(
+        &mut self,
+        ctx: &egui::Context,
+        export: &mut crate::plot_export::PlotExportQueue,
+    ) {
         self.drain_messages();
 
         egui::TopBottomPanel::top("calibration_top").show(ctx, |ui| {
@@ -100,24 +251,39 @@ impl CalibrationMode {
             ui.separator();
             ui.label(&self.input_files_info);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy, egui::Button::new("Select Raw Files...")).clicked() {
+                if ui
+                    .add_enabled(!self.is_busy, egui::Button::new("Select Files"))
+                    .clicked()
+                {
                     self.select_files();
                 }
-                if ui.add_enabled(!self.is_busy, egui::Button::new("Select Excel Files...")).clicked() {
-                    self.select_excel_files();
+                if ui
+                    .add_enabled(!self.is_busy, egui::Button::new("Check Header"))
+                    .clicked()
+                {
+                    self.check_header();
                 }
             });
 
             ui.horizontal(|ui| {
-                ui.label("Output name:");
+                ui.label("Output File Name:");
                 ui.text_edit_singleline(&mut self.output_file_name);
             });
 
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy && !self.input_files.is_empty(), egui::Button::new("Process to Excel")).clicked() {
+                if ui
+                    .add_enabled(
+                        !self.is_busy && !self.input_files.is_empty(),
+                        egui::Button::new("Pre-Process to Excel"),
+                    )
+                    .clicked()
+                {
                     self.process_data();
                 }
-                if ui.add_enabled(!self.is_busy, egui::Button::new("Read Data")).clicked() {
+                if ui
+                    .add_enabled(!self.is_busy, egui::Button::new("Process Data"))
+                    .clicked()
+                {
                     self.read_data();
                 }
                 if ui.button("Reset").clicked() {
@@ -130,7 +296,10 @@ impl CalibrationMode {
                 .selected_text(["L1", "L2", "L6", "L7"][self.selected_layer_index])
                 .show_ui(ui, |ui| {
                     for (i, name) in ["L1", "L2", "L6", "L7"].iter().enumerate() {
-                        if ui.selectable_value(&mut self.selected_layer_index, i, *name).changed() {
+                        if ui
+                            .selectable_value(&mut self.selected_layer_index, i, *name)
+                            .changed()
+                        {
                             self.update_plots(true);
                         }
                     }
@@ -154,12 +323,6 @@ impl CalibrationMode {
                 self.update_plots(true);
             }
             ui.horizontal(|ui| {
-                // Fit-solving (up to 16 channels x 4 fits) is deferred until
-                // the drag settles (`drag_stopped`) or a typed value is
-                // committed (`lost_focus`), not re-run on every frame of the
-                // drag - see `update_plots`'s doc comment. The histogram
-                // itself still updates live via `changed()` so the bars
-                // track the drag.
                 ui.label("X Min");
                 let min_resp = ui.add(egui::DragValue::new(&mut self.x_axis_min));
                 if min_resp.changed() {
@@ -187,10 +350,18 @@ impl CalibrationMode {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Fits:");
                 let mut fits_changed = false;
-                fits_changed |= ui.checkbox(&mut self.show_gaussian_fit, "Gaussian").changed();
-                fits_changed |= ui.checkbox(&mut self.show_hemg_single_fit, "HEMG single").changed();
-                fits_changed |= ui.checkbox(&mut self.show_hemg_double_fit, "HEMG double").changed();
-                fits_changed |= ui.checkbox(&mut self.show_lorentzian_fit, "Lorentzian").changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_gaussian_fit, "Gaussian")
+                    .changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_hemg_single_fit, "HEMG single")
+                    .changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_hemg_double_fit, "HEMG double")
+                    .changed();
+                fits_changed |= ui
+                    .checkbox(&mut self.show_lorentzian_fit, "Lorentzian")
+                    .changed();
                 if fits_changed {
                     self.update_plots(true);
                 }
@@ -199,7 +370,9 @@ impl CalibrationMode {
             ui.separator();
             ui.colored_label(Color32::LIGHT_GRAY, &self.status_message);
             if self.is_busy {
-                ui.add(egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage());
+                ui.add(
+                    egui::ProgressBar::new((self.progress_value / 100.0) as f32).show_percentage(),
+                );
             }
             if !self.header_check_status.is_empty() {
                 ui.label(&self.header_check_status);
@@ -207,13 +380,24 @@ impl CalibrationMode {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let (x_channels, z_channels) = self.channels.split_at_mut(8);
-                ui.columns(2, |columns| {
-                    channel_block_ui(&mut columns[0], "X-direction (X1-X8)", x_channels, export);
-                    channel_block_ui(&mut columns[1], "Z-direction (Z1-Z8)", z_channels, export);
-                });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, CalibrationTab::ChannelView, "Channel View");
+                ui.selectable_value(&mut self.active_tab, CalibrationTab::DataTable, "Data Table");
             });
+            ui.separator();
+
+            match self.active_tab {
+                CalibrationTab::ChannelView => {
+                    egui::ScrollArea::vertical().id_salt("cal_channel_scroll").show(ui, |ui| {
+                        let (x_channels, z_channels) = self.channels.split_at_mut(8);
+                        ui.columns(2, |columns| {
+                            channel_block_ui(&mut columns[0], "X-direction (X1-X8)", x_channels, export);
+                            channel_block_ui(&mut columns[1], "Z-direction (Z1-Z8)", z_channels, export);
+                        });
+                    });
+                }
+                CalibrationTab::DataTable => self.data_table_ui(ui),
+            }
         });
 
         if self.is_busy {
@@ -232,6 +416,7 @@ impl CalibrationMode {
                     self.accumulator = acc;
                     self.update_plots(true);
                 }
+                WorkerMsg::TableRows(rows) => self.rows = rows,
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.is_busy = false;
@@ -243,8 +428,8 @@ impl CalibrationMode {
     fn reset(&mut self) {
         self.input_files.clear();
         self.input_files_info = "No files selected".to_string();
-        self.read_multiple_files = false;
         self.accumulator = CalibrationAccumulator::default();
+        self.rows.clear();
         for ch in &mut self.channels {
             ch.counts.clear();
             ch.bin_centers.clear();
@@ -261,21 +446,22 @@ impl CalibrationMode {
     }
 
     fn select_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().add_filter("Text files", &["txt"]).pick_files() {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("Text files", &["txt"])
+            .pick_files()
+        {
             self.input_files_info = format!("{} txt file(s) selected", files.len());
             self.input_files = files;
-            self.read_multiple_files = false;
             self.status_message = "Files selected.".to_string();
         }
     }
 
-    fn select_excel_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().add_filter("Excel files", &["xlsx"]).set_title("Select Excel files to read").pick_files() {
-            self.input_files_info = format!("{} Excel file(s) selected for reading", files.len());
-            self.input_files = files;
-            self.read_multiple_files = true;
-            self.status_message = "Excel files selected.".to_string();
-        }
+    fn check_header(&mut self) {
+        self.is_busy = true;
+        self.header_check_status = "Checking...".to_string();
+        let output_name = self.output_file_name.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || header_check_worker(output_name, tx));
     }
 
     fn process_data(&mut self) {
@@ -291,41 +477,25 @@ impl CalibrationMode {
         self.is_busy = true;
         self.progress_value = 0.0;
         self.accumulator = CalibrationAccumulator::default();
+        self.rows.clear();
 
-        let files_to_read: Vec<PathBuf> = if self.read_multiple_files && !self.input_files.is_empty() {
-            self.input_files
-                .iter()
-                .filter(|f| f.extension().map(|e| e.eq_ignore_ascii_case("xlsx")).unwrap_or(false) && f.exists())
-                .cloned()
-                .collect()
-        } else {
-            match io::file_helper::find_excel_file(&self.output_file_name) {
-                Some(f) => vec![f],
-                None => {
-                    self.status_message = format!("File not found: {}.xlsx", self.output_file_name);
-                    self.is_busy = false;
-                    return;
-                }
+        let files_to_read = match io::file_helper::find_excel_file(&self.output_file_name, "Calibration") {
+            Some(f) => vec![f],
+            None => {
+                self.status_message = format!(
+                    "File not found: {}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)",
+                    self.output_file_name
+                );
+                self.is_busy = false;
+                return;
             }
         };
-
-        if files_to_read.is_empty() {
-            self.status_message = "No valid Excel files found in selection.".to_string();
-            self.is_busy = false;
-            return;
-        }
 
         let tx = self.tx.clone();
         std::thread::spawn(move || read_data_worker(files_to_read, tx));
     }
 
-    /// Rebuilds histograms for the selected layer/axis and, unless
-    /// `recompute_fits` is `false`, re-solves the enabled fit overlays too.
-    /// Fit solving (up to 16 channels x 4 fits, with "HEMG single" costing
-    /// two solves each - see `fit_overlay::compute_fits`) is real work on
-    /// the UI thread; `recompute_fits: false` lets a caller keep the bars
-    /// responsive (e.g. while an X Min/Max `DragValue` is actively being
-    /// dragged) without re-solving on every frame of the drag.
+    /// Rebuilds histograms for the selected layer/axis
     fn update_plots(&mut self, recompute_fits: bool) {
         let source = if self.selected_x_axis_index == 1 {
             self.accumulator.voltage_columns(self.selected_layer_index)
@@ -341,16 +511,23 @@ impl CalibrationMode {
         };
 
         for ch in 0..16 {
-            let data_for_channel: Vec<f64> = source[ch].iter().copied().filter(|&d| d > 0.0).collect();
+            let data_for_channel: Vec<f64> =
+                source[ch].iter().copied().filter(|&d| d > 0.0).collect();
             if data_for_channel.is_empty() {
                 self.channels[ch].active_fits.clear();
                 continue;
             }
             let (counts, bin_centers) =
-                baseline_core::baseline_processing::build_histogram_avg_centers(&data_for_channel, self.x_axis_min, self.x_axis_max, 500);
+                baseline_core::baseline_processing::build_histogram_avg_centers(
+                    &data_for_channel,
+                    self.x_axis_min,
+                    self.x_axis_max,
+                    500,
+                );
 
             if recompute_fits {
-                let (stats, fits) = fit_overlay::compute_fits(&self.math, &bin_centers, &counts, &flags);
+                let (stats, fits) =
+                    fit_overlay::compute_fits(&self.math, &bin_centers, &counts, &flags);
                 self.channels[ch].mu = stats.mu;
                 self.channels[ch].sigma = stats.sigma;
                 self.channels[ch].fwhm = stats.fwhm;
@@ -375,16 +552,85 @@ impl CalibrationMode {
             self.channels[ch].bin_centers = bin_centers;
         }
     }
+
+    /// Data Table tab: one row per raw line, decoded per `Calibration.txt`.
+    fn data_table_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.rows.is_empty(), egui::Button::new("Export Table as CSV...")).clicked() {
+                self.export_table_csv();
+            }
+            ui.label(format!("{} row(s)", self.rows.len()));
+        });
+        ui.separator();
+
+        let headers = calibration_table_headers();
+        let widths: Vec<f32> = headers.iter().map(|h| header_column_width(ui, h)).collect();
+
+        egui::ScrollArea::horizontal().id_salt("cal_data_table_hscroll").show(ui, |ui| {
+            let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+
+            egui::Grid::new("cal_data_table_header").show(ui, |ui| {
+                for (header, &width) in headers.iter().zip(&widths) {
+                    ui.add_sized([width, row_height], egui::Label::new(egui::RichText::new(header).strong()).truncate());
+                }
+                ui.end_row();
+            });
+
+            egui::ScrollArea::vertical().id_salt("cal_data_table_vscroll").show_rows(ui, row_height, self.rows.len(), |ui, visible_range| {
+                egui::Grid::new("cal_data_table_body").striped(true).start_row(visible_range.start).show(ui, |ui| {
+                    for row in &self.rows[visible_range] {
+                        let cells = calibration_row_cells(row);
+                        for (cell, &width) in cells.iter().zip(&widths) {
+                            ui.add_sized([width, row_height], egui::Label::new(cell).truncate());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Export the data table as CSV. Value-list cells (L1/L2/L6/L7)
+    fn export_table_csv(&mut self) {
+        if self.rows.is_empty() {
+            self.status_message = "No rows to export - run Read Data first.".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().set_file_name("calibration_table.csv").add_filter("CSV", &["csv"]).save_file() else {
+            return;
+        };
+
+        let mut csv = calibration_table_headers().iter().map(|h| csv_field(h)).collect::<Vec<_>>().join(",");
+        csv.push('\n');
+        for row in &self.rows {
+            csv.push_str(&calibration_row_cells(row).iter().map(|c| csv_field(c)).collect::<Vec<_>>().join(","));
+            csv.push('\n');
+        }
+
+        match std::fs::write(&path, csv) {
+            Ok(()) => self.status_message = format!("Exported {} row(s) to {}", self.rows.len(), path.display()),
+            Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
+        }
+    }
 }
 
 fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<WorkerMsg>) {
-    match io::segment_filter::filter_e225_segments_from_files(&files, baseline_core::models::shared::AppConstants::SEGMENT_HEX_LENGTH) {
+    match io::segment_filter::filter_e225_segments_from_files(
+        &files,
+        baseline_core::models::shared::AppConstants::SEGMENT_HEX_LENGTH,
+    ) {
         Ok(segments) if !segments.is_empty() => {
-            let _ = tx.send(WorkerMsg::Status(format!("Saving {} segments to Excel...", segments.len()), Color32::GRAY));
-            match io::file_helper::resolve_excel_save_path(&output_name, "") {
+            let _ = tx.send(WorkerMsg::Status(
+                format!("Saving {} segments to Excel...", segments.len()),
+                Color32::GRAY,
+            ));
+            match io::file_helper::resolve_excel_save_path(&output_name, "Calibration") {
                 Ok(path) => match io::excel::save_lines_to_excel(&segments, &path) {
                     Ok(()) => {
-                        let _ = tx.send(WorkerMsg::Status("Processing complete.".to_string(), Color32::from_rgb(50, 200, 50)));
+                        let _ = tx.send(WorkerMsg::Status(
+                            "Processing complete.".to_string(),
+                            Color32::from_rgb(50, 200, 50),
+                        ));
                     }
                     Err(e) => {
                         let _ = tx.send(WorkerMsg::Error(e));
@@ -396,7 +642,10 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
             }
         }
         Ok(_) => {
-            let _ = tx.send(WorkerMsg::Status("No valid segments found.".to_string(), Color32::RED));
+            let _ = tx.send(WorkerMsg::Status(
+                "No valid segments found.".to_string(),
+                Color32::RED,
+            ));
         }
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(format!("Error: {e}")));
@@ -409,6 +658,7 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
 fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     let mut accumulator = CalibrationAccumulator::default();
     accumulator.reset(1_000_000);
+    let mut table_rows: Vec<CalibrationRow> = Vec::new();
 
     let mut header_ok = true;
     let file_count = files.len();
@@ -429,7 +679,11 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
 
             if file_index == 0 && row_index == 0 {
                 let valid = validate_header(&hex_data);
-                let _ = tx.send(WorkerMsg::HeaderCheck(if valid { "Checksum OK".to_string() } else { "Checksum Mismatch".to_string() }));
+                let _ = tx.send(WorkerMsg::HeaderCheck(if valid {
+                    "Checksum OK".to_string()
+                } else {
+                    "Checksum Mismatch".to_string()
+                }));
                 if !valid {
                     header_ok = false;
                     break;
@@ -437,12 +691,21 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
             }
 
             accumulator.process_calibration(&hex_data);
+            if let Some(line) = parse_calibration_line(&hex_data) {
+                table_rows.push(line.into());
+            }
 
             if row_index % 1000 == 0 {
                 let progress = (row_index as f64 / total_rows.max(1) as f64) * 100.0;
                 let _ = tx.send(WorkerMsg::Progress(progress));
                 let _ = tx.send(WorkerMsg::Status(
-                    format!("File {}/{}: {}/{} rows", file_index + 1, file_count, row_index, total_rows),
+                    format!(
+                        "File {}/{}: {}/{} rows",
+                        file_index + 1,
+                        file_count,
+                        row_index,
+                        total_rows
+                    ),
                     Color32::GRAY,
                 ));
             }
@@ -454,17 +717,48 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
     }
 
     if !header_ok {
-        let _ = tx.send(WorkerMsg::Status("Stopped: Checksum Mismatch".to_string(), Color32::RED));
+        let _ = tx.send(WorkerMsg::Status(
+            "Stopped: Checksum Mismatch".to_string(),
+            Color32::RED,
+        ));
         let _ = tx.send(WorkerMsg::Busy(false));
         return;
     }
 
-    // Hand the fully populated accumulator back to the UI thread, which
-    // recomputes histograms for the currently-selected layer/axis (and again
-    // on every later layer/axis change) via `update_plots`.
     let _ = tx.send(WorkerMsg::DataLoaded(accumulator));
+    let _ = tx.send(WorkerMsg::TableRows(table_rows));
 
-    let _ = tx.send(WorkerMsg::Status("Complete!".to_string(), Color32::from_rgb(50, 200, 50)));
+    let _ = tx.send(WorkerMsg::Status(
+        "Complete!".to_string(),
+        Color32::from_rgb(50, 200, 50),
+    ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
+    let _ = tx.send(WorkerMsg::Busy(false));
+}
+
+fn header_check_worker(output_name: String, tx: Sender<WorkerMsg>) {
+    let Some(file_path) = io::file_helper::find_excel_file(&output_name, "Calibration") else {
+        let _ = tx.send(WorkerMsg::Error(format!(
+            "File not found: {output_name}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)"
+        )));
+        let _ = tx.send(WorkerMsg::Busy(false));
+        return;
+    };
+
+    match io::excel::read_excel_column_a(&file_path) {
+        Ok(rows) => {
+            let mut result = "Header is correct!".to_string();
+            for (i, hex) in rows.iter().enumerate() {
+                if !hex.starts_with(AppConstants::HEADER_START) {
+                    result = format!("Header is INCORRECT! at data row no. {}", i + 1);
+                    break;
+                }
+            }
+            let _ = tx.send(WorkerMsg::HeaderCheck(result));
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!("Error reading file: {e}")));
+        }
+    }
     let _ = tx.send(WorkerMsg::Busy(false));
 }

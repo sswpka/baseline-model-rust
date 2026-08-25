@@ -271,6 +271,41 @@ impl MathService {
         result.fwhm = final_fwhm;
         result.resolution = final_res;
         calculate_fit_stats(&mut result, x_data, y_data, &fit_curve);
+
+        let roi_min = x_roi.iter().copied().fold(f64::INFINITY, f64::min);
+        let roi_max = x_roi.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let roi_span = roi_max - roi_min;
+        let left_pitch = max_index
+            .checked_sub(1)
+            .map(|i| x_data[max_index] - x_data[i])
+            .filter(|pitch| pitch.is_finite() && *pitch > 0.0);
+        let right_pitch = x_data
+            .get(max_index + 1)
+            .map(|&x| x - x_data[max_index])
+            .filter(|pitch| pitch.is_finite() && *pitch > 0.0);
+        let local_pitch = match (left_pitch, right_pitch) {
+            (Some(left), Some(right)) => left.max(right),
+            (Some(pitch), None) | (None, Some(pitch)) => pitch,
+            (None, None) => return FittingResult::empty(x_data.len()),
+        };
+        if !final_amp_real.is_finite()
+            || final_amp_real <= 0.0
+            || !final_sigma.is_finite()
+            || final_sigma <= 0.0
+            || !final_mean.is_finite()
+            || !roi_span.is_finite()
+            || final_sigma > roi_span
+            || final_mean < roi_min
+            || final_mean > roi_max
+            || !result.r_squared.is_finite()
+            || result.r_squared <= 0.0
+            || !local_pitch.is_finite()
+            || local_pitch <= 0.0
+            || !final_fwhm.is_finite()
+            || final_fwhm < local_pitch
+        {
+            return FittingResult::empty(x_data.len());
+        }
         result
     }
 
@@ -293,8 +328,8 @@ impl MathService {
         _raw_data: Option<&[f64]>,
         config: Option<&HemgFitConfig>,
     ) -> FittingResult {
-        if x_data.is_empty() || y_data.is_empty() {
-            return FittingResult::empty(0);
+        if x_data.len() < 10 || x_data.len() != y_data.len() {
+            return FittingResult::empty(x_data.len());
         }
         let owned_config;
         let config = match config {
@@ -337,6 +372,9 @@ impl MathService {
         initial_guess: Option<&[f64]>,
         fixed_params: Option<&[bool]>,
     ) -> FittingResult {
+        if x_data.len() < 10 || x_data.len() != y_data.len() {
+            return FittingResult::empty(x_data.len());
+        }
         let config = HemgFitConfig::default();
         let (fit_curve, parameters) =
             hemg::hemg_double_sided_fit(x_data, y_data, initial_guess, fixed_params, &config);
@@ -534,4 +572,3 @@ fn solve_gaussian(a: &[f64], b: &[f64], x: &mut [f64], n: usize) -> bool {
     }
     true
 }
-

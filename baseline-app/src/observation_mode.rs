@@ -1,17 +1,4 @@
-//! Port of Observation mode (`ObservationViewModel` + `.Commands.cs` +
-//! `.FileOperations.cs`). Deferred (see project notes): the
-//! `ObservationDetailWindow` (per-histogram peak-locking) and optional
-//! Kalman/Z-score filters - this covers file ingestion and the DSSD
-//! pulse-height/strip and
-//! BGO gain histograms that `AnalyzeFiles`/`ObservationDataProcessor`
-//! actually compute, switchable via the DSSD/X-Strip/Y-Strip/BGO view-mode
-//! selector (mirrors the original's DSSD/BGO tabs and their inner
-//! Pulse-Height/X-Strip/Y-Strip tabs). Unlike the original (a single
-//! Gaussian/Lorentzian `ComboBox` per section), the fit-overlay controls
-//! here are independent checkboxes - Gaussian, Lorentzian, and HEMG can all
-//! be plotted at once, matching Baseline mode's fit UI. Observation-specific
-//! ROI preprocessing and full-ROI fits stay local to this module; generic
-//! Baseline/Calibration overlays are unchanged.
+//! Port of Observation mode
 
 use baseline_core::math::MathService;
 use baseline_core::models::observation::{BgoLayer, DetectorLayer};
@@ -54,10 +41,6 @@ fn bgo_byte_ranges(layer: BgoLayer) -> (&'static str, &'static str) {
     }
 }
 
-/// "(Particle Byte N)" - disambiguates these particle-block-relative,
-/// 0-indexed offsets from the line-level "(Byte N)" header/tail labels,
-/// which are 0-indexed absolute offsets into the whole line (a different
-/// base position, same indexing convention).
 fn particle_byte_label(range: &str) -> String {
     format!("(Particle Byte {range})")
 }
@@ -77,19 +60,6 @@ fn line_extra_header(field: &baseline_core::observation::LineTailField) -> Strin
     format!("{} (Byte {byte_range})", field.label)
 }
 
-/// One decoded particle event for the Data Table tab: every series (each
-/// DSSD layer's (X, Y) pulse height, each BGO layer's (High, Low) gain) at
-/// the timestamp they all share, since they're decoded from the same
-/// particle payload (see `ParticleResult::time`). `dssd`/`bgo` are fixed
-/// positional arrays against `DSSD_TABLE_LAYERS`/`BGO_TABLE_LAYERS`, since the
-/// Data Table tab re-reads every event every frame and a large file can decode
-/// well over 100k of them.
-///
-/// Both `dssd` and `bgo` are raw ADC (0-16383), straight from
-/// `ParticleResult::dssd_pulses`/`bgo_pulses` - the Data Table converts
-/// `dssd` to volts at render/export time when `DssdDataUnit::Voltage` is
-/// selected (see `adc_to_volts`, `data_table_ui`), rather than baking a unit
-/// choice into the stored event.
 #[derive(Debug, Clone)]
 struct EventRow {
     packet_sync: String,
@@ -102,8 +72,6 @@ struct EventRow {
     dssd_position: [i32; 4],
     dssd: [(i32, i32); 4],
     bgo: [(i32, i32); 3],
-    /// Raw values for `baseline_core::observation::LINE_TAIL_FIELDS`, in
-    /// that same order.
     line_extra: Arc<[String]>,
 }
 
@@ -156,26 +124,7 @@ struct ObsFitCurve {
 
 const EMPTY_HISTOGRAM_STATS: &str = "Peak: -   Counts: 0   Mean: -   RMS: -   FWHM: -   Res: -";
 
-/// Descriptive stats line for one histogram (Peak/Counts/Mean/RMS/FWHM/Res),
-/// matching the original's `PlotHistogram`/`PlotStripHistogram`/
-/// `PlotBGOHistogram`:
-/// - When a fit is active, Peak/Mean/RMS/FWHM/Res come from the *fit*
-///   (`FittingResult::peak`/`mu`/`sigma`/`fwhm`/`resolution`), not the raw
-///   data - e.g. the original's `PlotHistogram` sets `peakLabel.Text =
-///   fitResult.Peak`, not the histogram's raw max bin. `fits` is
-///   `compute_fits`'s output for this histogram; when more than one fit
-///   checkbox is enabled at once (this port's independent-checkboxes design,
-///   unlike the original's single fit-method `ComboBox`), the first entry
-///   wins - `compute_fits` always tries Gaussian, then Lorentzian, then HEMG,
-///   in that order.
-/// - When no fit is active/valid, Peak/Mean/RMS fall back to raw histogram
-///   stats (mirroring `PlotStripHistogram`'s non-fit `else` branch: raw max
-///   bin, arithmetic mean, population std of the raw samples) - but FWHM/Res
-///   are left as "-", matching the original, which never computes those two
-///   without a successful fit.
-/// - Counts is independent of fitting (raw positive-sample count), but,
-///   like the fit itself (see `compute_fits`), is restricted to `x_range`
-///   when set. This port intentionally applies the Fit/View ROI to stats too.
+/// Descriptive stats line for one histogram
 fn format_histogram_stats(
     math: &MathService,
     hist: &[i32],
@@ -345,7 +294,7 @@ impl ObservationMode {
             ui.separator();
             ui.label(&self.input_files_info);
             if ui
-                .add_enabled(!self.is_busy, egui::Button::new("Select Files..."))
+                .add_enabled(!self.is_busy, egui::Button::new("Select Files"))
                 .clicked()
             {
                 self.select_files();
@@ -355,7 +304,7 @@ impl ObservationMode {
                 if ui
                     .add_enabled(
                         !self.is_busy && !self.input_files.is_empty(),
-                        egui::Button::new("Analyze Files"),
+                        egui::Button::new("Process Data"),
                     )
                     .clicked()
                 {
@@ -495,7 +444,7 @@ impl ObservationMode {
                 ui.selectable_value(
                     &mut self.active_tab,
                     ObservationTab::GraphView,
-                    "Grid Graph Visualize",
+                    "Graph Visualization",
                 );
                 ui.selectable_value(
                     &mut self.active_tab,

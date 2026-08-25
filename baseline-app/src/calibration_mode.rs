@@ -6,6 +6,7 @@ use baseline_core::calibration::{
 };
 use baseline_core::io;
 use baseline_core::math::MathService;
+use baseline_core::models::shared::AppConstants;
 use baseline_core::observation::data_processor::{split_hex_data, validate_header};
 use chrono::{DateTime, Utc};
 use egui::Color32;
@@ -159,7 +160,6 @@ pub struct CalibrationMode {
     input_files: Vec<PathBuf>,
     input_files_info: String,
     output_file_name: String,
-    read_multiple_files: bool,
 
     selected_layer_index: usize,  // 0=L1,1=L2,2=L6,3=L7
     selected_x_axis_index: usize, // 0=ADC,1=Voltage
@@ -213,7 +213,6 @@ impl Default for CalibrationMode {
             input_files: Vec::new(),
             input_files_info: "No files selected".to_string(),
             output_file_name: "CalibrationResult".to_string(),
-            read_multiple_files: false,
             selected_layer_index: 0,
             selected_x_axis_index: 0,
             x_axis_min: 0.0,
@@ -253,21 +252,21 @@ impl CalibrationMode {
             ui.label(&self.input_files_info);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.is_busy, egui::Button::new("Select Raw Files..."))
+                    .add_enabled(!self.is_busy, egui::Button::new("Select Files"))
                     .clicked()
                 {
                     self.select_files();
                 }
                 if ui
-                    .add_enabled(!self.is_busy, egui::Button::new("Select Excel Files..."))
+                    .add_enabled(!self.is_busy, egui::Button::new("Check Header"))
                     .clicked()
                 {
-                    self.select_excel_files();
+                    self.check_header();
                 }
             });
 
             ui.horizontal(|ui| {
-                ui.label("Output name:");
+                ui.label("Output File Name:");
                 ui.text_edit_singleline(&mut self.output_file_name);
             });
 
@@ -275,14 +274,14 @@ impl CalibrationMode {
                 if ui
                     .add_enabled(
                         !self.is_busy && !self.input_files.is_empty(),
-                        egui::Button::new("Process to Excel"),
+                        egui::Button::new("Pre-Process to Excel"),
                     )
                     .clicked()
                 {
                     self.process_data();
                 }
                 if ui
-                    .add_enabled(!self.is_busy, egui::Button::new("Read Data"))
+                    .add_enabled(!self.is_busy, egui::Button::new("Process Data"))
                     .clicked()
                 {
                     self.read_data();
@@ -429,7 +428,6 @@ impl CalibrationMode {
     fn reset(&mut self) {
         self.input_files.clear();
         self.input_files_info = "No files selected".to_string();
-        self.read_multiple_files = false;
         self.accumulator = CalibrationAccumulator::default();
         self.rows.clear();
         for ch in &mut self.channels {
@@ -454,22 +452,16 @@ impl CalibrationMode {
         {
             self.input_files_info = format!("{} txt file(s) selected", files.len());
             self.input_files = files;
-            self.read_multiple_files = false;
             self.status_message = "Files selected.".to_string();
         }
     }
 
-    fn select_excel_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new()
-            .add_filter("Excel files", &["xlsx"])
-            .set_title("Select Excel files to read")
-            .pick_files()
-        {
-            self.input_files_info = format!("{} Excel file(s) selected for reading", files.len());
-            self.input_files = files;
-            self.read_multiple_files = true;
-            self.status_message = "Excel files selected.".to_string();
-        }
+    fn check_header(&mut self) {
+        self.is_busy = true;
+        self.header_check_status = "Checking...".to_string();
+        let output_name = self.output_file_name.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || header_check_worker(output_name, tx));
     }
 
     fn process_data(&mut self) {
@@ -487,38 +479,17 @@ impl CalibrationMode {
         self.accumulator = CalibrationAccumulator::default();
         self.rows.clear();
 
-        let files_to_read: Vec<PathBuf> = if self.read_multiple_files
-            && !self.input_files.is_empty()
-        {
-            self.input_files
-                .iter()
-                .filter(|f| {
-                    f.extension()
-                        .map(|e| e.eq_ignore_ascii_case("xlsx"))
-                        .unwrap_or(false)
-                        && f.exists()
-                })
-                .cloned()
-                .collect()
-        } else {
-            match io::file_helper::find_excel_file(&self.output_file_name, "Calibration") {
-                Some(f) => vec![f],
-                None => {
-                    self.status_message = format!(
-                        "File not found: {}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)",
-                        self.output_file_name
-                    );
-                    self.is_busy = false;
-                    return;
-                }
+        let files_to_read = match io::file_helper::find_excel_file(&self.output_file_name, "Calibration") {
+            Some(f) => vec![f],
+            None => {
+                self.status_message = format!(
+                    "File not found: {}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)",
+                    self.output_file_name
+                );
+                self.is_busy = false;
+                return;
             }
         };
-
-        if files_to_read.is_empty() {
-            self.status_message = "No valid Excel files found in selection.".to_string();
-            self.is_busy = false;
-            return;
-        }
 
         let tx = self.tx.clone();
         std::thread::spawn(move || read_data_worker(files_to_read, tx));
@@ -762,5 +733,32 @@ fn read_data_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
         Color32::from_rgb(50, 200, 50),
     ));
     let _ = tx.send(WorkerMsg::Progress(100.0));
+    let _ = tx.send(WorkerMsg::Busy(false));
+}
+
+fn header_check_worker(output_name: String, tx: Sender<WorkerMsg>) {
+    let Some(file_path) = io::file_helper::find_excel_file(&output_name, "Calibration") else {
+        let _ = tx.send(WorkerMsg::Error(format!(
+            "File not found: {output_name}.xlsx (searched Documents/DSSD_Analysis/Calibration and legacy locations)"
+        )));
+        let _ = tx.send(WorkerMsg::Busy(false));
+        return;
+    };
+
+    match io::excel::read_excel_column_a(&file_path) {
+        Ok(rows) => {
+            let mut result = "Header is correct!".to_string();
+            for (i, hex) in rows.iter().enumerate() {
+                if !hex.starts_with(AppConstants::HEADER_START) {
+                    result = format!("Header is INCORRECT! at data row no. {}", i + 1);
+                    break;
+                }
+            }
+            let _ = tx.send(WorkerMsg::HeaderCheck(result));
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!("Error reading file: {e}")));
+        }
+    }
     let _ = tx.send(WorkerMsg::Busy(false));
 }

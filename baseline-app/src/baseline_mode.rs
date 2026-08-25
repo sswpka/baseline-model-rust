@@ -252,7 +252,7 @@ pub struct BaselineMode {
 impl Default for BaselineMode {
     fn default() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let output_directory_path = dirs_next_documents().join("BaselineModeOutputs_1");
+        let output_directory_path = dirs_next_documents().join("BaselineModeOutputs");
 
         let channels = (0..16)
             .map(|i| ChannelState {
@@ -401,12 +401,11 @@ impl BaselineMode {
     /// File open/export/header-check, plus the pre-process/process/
     /// stop/reset action buttons.
     fn file_and_actions_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("File & Actions");
         ui.label(&self.input_files_info);
 
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!self.is_busy, egui::Button::new("Select Files..."))
+                .add_enabled(!self.is_busy, egui::Button::new("Select Files"))
                 .clicked()
             {
                 self.select_files();
@@ -417,38 +416,10 @@ impl BaselineMode {
             {
                 self.check_header();
             }
-            if ui
-                .add_enabled(
-                    !self.is_busy && !self.selected_files.is_empty(),
-                    egui::Button::new("Read Data Table"),
-                )
-                .clicked()
-            {
-                self.read_data_table();
-            }
         });
 
-        ui.label("Output dir:");
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(self.output_directory_path.display().to_string())
-                        .monospace(),
-                )
-                .wrap(),
-            );
-            if ui.button("Browse...").clicked() {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Select Output Root Folder")
-                    .pick_folder()
-                {
-                    self.output_directory_path = dir;
-                }
-            }
-        });
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Output file:");
+        ui.horizontal(|ui| {
+            ui.label("Output File Name:");
             ui.text_edit_singleline(&mut self.output_file_name);
         });
 
@@ -472,13 +443,6 @@ impl BaselineMode {
                 .clicked()
             {
                 self.pre_process_data();
-            }
-            if ui
-                .add_enabled(self.is_busy, egui::Button::new("Stop"))
-                .clicked()
-            {
-                self.status_message =
-                    "Stopping is not yet wired up for background threads in this port.".to_string();
             }
             if ui
                 .add_enabled(!self.is_busy, egui::Button::new("Process Data"))
@@ -805,22 +769,6 @@ impl BaselineMode {
         std::thread::spawn(move || check_header_worker(file_path, delay_time_ms, k_factor, tx));
     }
 
-    fn read_data_table(&mut self) {
-        if self.selected_files.is_empty() {
-            self.status_message = "Please select files first.".to_string();
-            return;
-        }
-        self.is_busy = true;
-        self.progress_value = 0.0;
-        self.rows.clear();
-        self.status_message = "Reading data table...".to_string();
-        self.status_color = Color32::from_rgb(255, 165, 0);
-
-        let files = self.selected_files.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || read_data_table_worker(files, tx));
-    }
-
     /// Data Table tab: one row per raw line, decoded per `Baseline.txt`.
     fn data_table_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -861,7 +809,7 @@ impl BaselineMode {
     /// Export the data table as CSV
     fn export_table_csv(&mut self) {
         if self.rows.is_empty() {
-            self.status_message = "No rows to export - run Read Data Table first.".to_string();
+            self.status_message = "No rows to export - run Process Data first.".to_string();
             return;
         }
         let Some(path) = rfd::FileDialog::new().set_file_name("baseline_table.csv").add_filter("CSV", &["csv"]).save_file() else {

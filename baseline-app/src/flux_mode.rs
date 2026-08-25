@@ -259,34 +259,34 @@ impl FluxMode {
             ui.label(&self.input_files_info);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.is_busy, egui::Button::new("Select Files..."))
+                    .add_enabled(!self.is_busy, egui::Button::new("Select Files"))
                     .clicked()
                 {
                     self.select_files();
                 }
                 if ui
-                    .add_enabled(!self.is_busy, egui::Button::new("Header Check"))
+                    .add_enabled(!self.is_busy, egui::Button::new("Check Header"))
                     .clicked()
                 {
                     self.header_check();
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("Output name:");
+                ui.label("Output File Name:");
                 ui.text_edit_singleline(&mut self.output_file_name);
             });
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
                         !self.is_busy && !self.selected_files.is_empty(),
-                        egui::Button::new("Process to Excel"),
+                        egui::Button::new("Pre-Process to Excel"),
                     )
                     .clicked()
                 {
                     self.process_data();
                 }
                 if ui
-                    .add_enabled(!self.is_busy, egui::Button::new("Read Data"))
+                    .add_enabled(!self.is_busy, egui::Button::new("Process Data"))
                     .clicked()
                 {
                     self.read_data();
@@ -336,7 +336,7 @@ impl FluxMode {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, FluxTab::Plots, "Plots");
+                ui.selectable_value(&mut self.active_tab, FluxTab::Plots, "Graph Visualization");
                 ui.selectable_value(&mut self.active_tab, FluxTab::DataTable, "Data Table");
             });
             ui.separator();

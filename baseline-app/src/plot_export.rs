@@ -1,5 +1,4 @@
-//! Function for handling the Right-click "image" menu for `egui_plot::Plot`s, shared by every mode: Save image as..., Copy image, Zoom to fit data, Open image in new window.
-//! Screenshot captures the whole native window
+//! Function for handling the Right-click "image" menu for `egui_plot
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -12,7 +11,7 @@ pub fn x_axis(label: impl Into<egui::WidgetText>) -> AxisHints<'static> {
     AxisHints::new_x().label(label).label_spacing(60.0..=61.0)
 }
 
-/// Same as `x_axis`, for the Y axis
+/// For the Y axis, same as x_axis
 pub fn y_axis(label: impl Into<egui::WidgetText>) -> AxisHints<'static> {
     AxisHints::new_y().label(label).label_spacing(20.0..=21.0)
 }
@@ -144,20 +143,11 @@ pub fn show<R>(
         Some(header_rect) => header_rect.union(plot_rect),
         None => plot_rect,
     };
-
-    // Mutated in place (not via `ui.scope`, which would parent the plot under
-    // a fresh auto-id `Ui` and change what `ui.make_persistent_id(id_source)`
-    // resolves to inside `Plot::show`, orphaning any saved pan/zoom state) and
-    // restored right after, since callers keep drawing on this same `ui`
-    // (e.g. the stats label below `histogram_plot_sized`'s plot) and
-    // shouldn't inherit the plot-only background/text color.
-    //
-    // `override_text_color` keeps egui_plot's axis ticks and grid readable
-    // against the plot-only black background.
+    
     let old_bg = ui.visuals().extreme_bg_color;
     let old_text = ui.visuals().override_text_color;
     ui.visuals_mut().extreme_bg_color = egui::Color32::BLACK;
-    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+    ui.visuals_mut().override_text_color = Some(egui::Color32::DARK_GRAY);
     let response = plot.show(ui, build_fn);
     ui.visuals_mut().extreme_bg_color = old_bg;
     ui.visuals_mut().override_text_color = old_text;

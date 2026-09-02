@@ -20,10 +20,12 @@ use crate::fit_overlay::{self, FitOverlayFlags};
 enum BaselineTab {
     ChannelView,
     DataTable,
+    Json,
 }
 
 /// One decoded raw line for the Data Table tab. Each of the 16
-/// Data-Acquisition blocks per layer (L1/L2/L6/L7) is its own cell, holding
+/// Data-Acquisition blocks per layer (L1/L2/L6/L7) holds 16 decoded
+/// per-channel values.
 #[derive(Debug, Clone)]
 struct BaselineRow {
     packet_sync: String,
@@ -33,10 +35,10 @@ struct BaselineRow {
     time: DateTime<Utc>,
     data_type: String,
     sample_index: i32,
-    l1_blocks: Vec<String>,
-    l2_blocks: Vec<String>,
-    l6_blocks: Vec<String>,
-    l7_blocks: Vec<String>,
+    l1_blocks: Vec<Vec<i32>>,
+    l2_blocks: Vec<Vec<i32>>,
+    l6_blocks: Vec<Vec<i32>>,
+    l7_blocks: Vec<Vec<i32>>,
     /// Values for `BASELINE_TAIL_FIELDS`, in that same order.
     tail: Vec<String>,
     reserved_hex: String,
@@ -131,6 +133,12 @@ fn baseline_table_headers() -> Vec<String> {
     headers
 }
 
+/// Joins one block's 16 decoded values into a comma-separated cell for the
+/// Data Table / CSV export.
+fn join_i32_values(values: &[i32]) -> String {
+    values.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
+}
+
 /// One row's cells for the Data Table tab and its CSV export
 fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
     let mut cells = vec![
@@ -143,7 +151,7 @@ fn baseline_row_cells(row: &BaselineRow) -> Vec<String> {
         row.sample_index.to_string(),
     ];
     for blocks in [&row.l1_blocks, &row.l2_blocks, &row.l6_blocks, &row.l7_blocks] {
-        cells.extend(blocks.iter().cloned());
+        cells.extend(blocks.iter().map(|b| join_i32_values(b)));
     }
     cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
@@ -159,6 +167,77 @@ fn csv_field(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Tail keys for the JSON view
+const BASELINE_JSON_TAIL_KEYS: [&str; 10] = [
+    "dssd1_temperature",
+    "fee1_current",
+    "fee1_temperature",
+    "dssd7_temperature",
+    "fee2_current",
+    "fee2_temperature",
+    "fee1_threshold",
+    "fee2_threshold",
+    "dssd1_temperature_dup",
+    "dssd4_temperature",
+];
+
+/// One Data Table row as a JSON object matching
+fn baseline_row_json(row: &BaselineRow) -> serde_json::Value {
+    use crate::json_view::{num_or_str, object};
+
+    let layer_blocks = |blocks: &[Vec<i32>]| {
+        object(
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (format!("block_{}", i + 1), serde_json::Value::from(b.clone()))),
+        )
+    };
+    let tail = object(
+        BASELINE_JSON_TAIL_KEYS
+            .iter()
+            .zip(&row.tail)
+            .map(|(k, v)| (k.to_string(), num_or_str(v))),
+    );
+
+    object([
+        (
+            "header".to_string(),
+            object([
+                ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
+                ("packet_id".to_string(), row.package_id.into()),
+                ("pakcet_seq".to_string(), row.packet_sequence.into()),
+                (
+                    "packet_data_len".to_string(),
+                    row.packet_data_length.into(),
+                ),
+                (
+                    "time".to_string(),
+                    format_event_time(row.time).into(),
+                ),
+                ("data_type".to_string(), row.data_type.clone().into()),
+                ("sample_index".to_string(), row.sample_index.into()),
+            ]),
+        ),
+        (
+            "data_acquisition".to_string(),
+            object([
+                ("l1".to_string(), layer_blocks(&row.l1_blocks)),
+                ("l2".to_string(), layer_blocks(&row.l2_blocks)),
+                ("l6".to_string(), layer_blocks(&row.l6_blocks)),
+                ("l7".to_string(), layer_blocks(&row.l7_blocks)),
+            ]),
+        ),
+        ("tail".to_string(), tail),
+        ("reserved".to_string(), row.reserved_hex.clone().into()),
+        ("checksum".to_string(), row.checksum_hex.clone().into()),
+    ])
+}
+
+fn baseline_rows_json(rows: &[BaselineRow]) -> Vec<serde_json::Value> {
+    rows.iter().map(baseline_row_json).collect()
 }
 
 enum WorkerMsg {
@@ -244,6 +323,8 @@ pub struct BaselineMode {
     active_tab: BaselineTab,
     /// Data Table tab
     rows: Vec<BaselineRow>,
+    /// Pretty-printed JSON of the first rows, for the JSON tab's preview.
+    json_preview: String,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -295,6 +376,7 @@ impl Default for BaselineMode {
             channels,
             active_tab: BaselineTab::ChannelView,
             rows: Vec::new(),
+            json_preview: String::new(),
             tx,
             rx,
         }
@@ -335,6 +417,7 @@ impl BaselineMode {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, BaselineTab::ChannelView, "Channel View");
                 ui.selectable_value(&mut self.active_tab, BaselineTab::DataTable, "Data Table");
+                ui.selectable_value(&mut self.active_tab, BaselineTab::Json, "JSON");
             });
             ui.separator();
 
@@ -349,6 +432,7 @@ impl BaselineMode {
                     });
                 }
                 BaselineTab::DataTable => self.data_table_ui(ui),
+                BaselineTab::Json => self.json_tab_ui(ui),
             }
         });
 
@@ -388,7 +472,10 @@ impl BaselineMode {
                     self.duration_str = duration;
                     self.can_save_mean = true;
                 }
-                WorkerMsg::TableRows(rows) => self.rows = rows,
+                WorkerMsg::TableRows(rows) => {
+                    self.json_preview = crate::json_view::preview_string(&baseline_rows_json(&rows));
+                    self.rows = rows;
+                }
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.status_color = Color32::RED;
@@ -610,6 +697,7 @@ impl BaselineMode {
         self.processed_data.clear();
         self.data_counts_str = "-".to_string();
         self.rows.clear();
+        self.json_preview.clear();
         for (i, ch) in self.channels.iter_mut().enumerate() {
             *ch = ChannelState {
                 channel_index: i,
@@ -826,6 +914,20 @@ impl BaselineMode {
         match std::fs::write(&path, csv) {
             Ok(()) => self.status_message = format!("Exported {} row(s) to {}", self.rows.len(), path.display()),
             Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
+        }
+    }
+
+    /// JSON tab: the decoded rows as JSON with preview and downloader
+    fn json_tab_ui(&mut self, ui: &mut egui::Ui) {
+        if crate::json_view::json_tab_ui(ui, self.rows.len(), &self.json_preview) {
+            match crate::json_view::save_json("baseline_data.json", &baseline_rows_json(&self.rows)) {
+                Ok(Some(path)) => {
+                    self.status_message =
+                        format!("Saved {} row(s) to {}", self.rows.len(), path.display())
+                }
+                Ok(None) => {}
+                Err(e) => self.status_message = format!("Failed to save JSON: {e}"),
+            }
         }
     }
 }

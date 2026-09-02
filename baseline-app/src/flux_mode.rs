@@ -18,6 +18,7 @@ const DETECTOR_AREA_M2: f64 = 32.0 * 32.0 * 1e-6;
 enum FluxTab {
     Plots,
     DataTable,
+    Json,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -40,7 +41,8 @@ struct FluxRow {
     particle_time: i32,
     /// Particle Counts L1-L7 (Byte 18-31), in that order
     particle_counts: Vec<i32>,
-    particle_info: String,
+    /// Particle Info (Byte 32-2031): 1000 decoded decimal values.
+    particle_info: Vec<i32>,
     /// Values for `FLUX_TAIL_FIELDS`, in that same order
     tail: Vec<String>,
     reserved_hex: String,
@@ -58,7 +60,7 @@ impl From<FluxLineResult> for FluxRow {
             data_type: r.data_type,
             particle_time: r.particle_time,
             particle_counts: r.particle_counts,
-            particle_info: r.particle_info.join(", "),
+            particle_info: r.particle_info,
             tail: r.tail,
             reserved_hex: r.reserved_hex,
             checksum_hex: r.checksum_hex,
@@ -136,7 +138,7 @@ fn flux_row_cells(row: &FluxRow) -> Vec<String> {
         row.particle_time.to_string(),
     ];
     cells.extend(row.particle_counts.iter().map(|c| c.to_string()));
-    cells.push(row.particle_info.clone());
+    cells.push(row.particle_info.iter().map(i32::to_string).collect::<Vec<_>>().join(", "));
     cells.extend(row.tail.iter().cloned());
     cells.push(row.reserved_hex.clone());
     cells.push(row.checksum_hex.clone());
@@ -151,6 +153,63 @@ fn csv_field(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Tail keys for the JSON view
+const FLUX_JSON_TAIL_KEYS: [&str; 12] = [
+    "dssd_1_temperature",
+    "fee1_current",
+    "fee1_temperature",
+    "dssd_7_temperature",
+    "fee2_current",
+    "fee2_temperature",
+    "fee1_threshold",
+    "fee2_threshold",
+    "bgo1_bias_voltage",
+    "bgo2_bias_voltage",
+    "bgo3_bias_voltage",
+    "bgo2_temperature",
+];
+
+/// One Data Table row as a JSON object
+fn flux_row_json(row: &FluxRow) -> serde_json::Value {
+    use crate::json_view::{num_or_str, object};
+
+    let mut pairs: Vec<(String, serde_json::Value)> = vec![(
+        "header".to_string(),
+        object([
+            ("packet_sync_code".to_string(), num_or_str(&row.packet_sync)),
+            ("packet_id".to_string(), row.package_id.into()),
+            ("pakcet_seq".to_string(), row.packet_sequence.into()),
+            ("packet_data_len".to_string(), row.packet_data_length.into()),
+            ("time".to_string(), format_event_time(row.time).into()),
+            ("data_type".to_string(), row.data_type.clone().into()),
+            ("particle_time".to_string(), row.particle_time.into()),
+        ]),
+    )];
+    for (i, count) in row.particle_counts.iter().enumerate() {
+        pairs.push((format!("particle_counts_l{}", i + 1), (*count).into()));
+    }
+    pairs.push((
+        "particle_info".to_string(),
+        serde_json::Value::from(row.particle_info.clone()),
+    ));
+    pairs.push((
+        "tail".to_string(),
+        object(
+            FLUX_JSON_TAIL_KEYS
+                .iter()
+                .zip(&row.tail)
+                .map(|(k, v)| (k.to_string(), num_or_str(v))),
+        ),
+    ));
+    pairs.push(("reserved".to_string(), row.reserved_hex.clone().into()));
+    pairs.push(("checksum".to_string(), row.checksum_hex.clone().into()));
+    object(pairs)
+}
+
+fn flux_rows_json(rows: &[FluxRow]) -> Vec<serde_json::Value> {
+    rows.iter().map(flux_row_json).collect()
 }
 
 enum WorkerMsg {
@@ -201,6 +260,8 @@ pub struct FluxMode {
     active_tab: FluxTab,
     /// Data Table tab
     rows: Vec<FluxRow>,
+    /// Pretty-printed JSON of the first rows, for the JSON tab's preview.
+    json_preview: String,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -239,6 +300,7 @@ impl Default for FluxMode {
             accumulator: FluxAccumulator::default(),
             active_tab: FluxTab::Plots,
             rows: Vec::new(),
+            json_preview: String::new(),
             tx,
             rx,
         }
@@ -338,6 +400,7 @@ impl FluxMode {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, FluxTab::Plots, "Graph Visualization");
                 ui.selectable_value(&mut self.active_tab, FluxTab::DataTable, "Data Table");
+                ui.selectable_value(&mut self.active_tab, FluxTab::Json, "JSON");
             });
             ui.separator();
 
@@ -392,6 +455,7 @@ impl FluxMode {
                     });
                 }
                 FluxTab::DataTable => self.data_table_ui(ui),
+                FluxTab::Json => self.json_tab_ui(ui),
             }
         });
 
@@ -421,7 +485,10 @@ impl FluxMode {
                 }
                 WorkerMsg::DataCount(c) => self.data_count = c,
                 WorkerMsg::LayersReady(layers) => self.layers = layers,
-                WorkerMsg::TableRows(rows) => self.rows = rows,
+                WorkerMsg::TableRows(rows) => {
+                    self.json_preview = crate::json_view::preview_string(&flux_rows_json(&rows));
+                    self.rows = rows;
+                }
                 WorkerMsg::Error(e) => {
                     self.status_message = e;
                     self.is_busy = false;
@@ -441,6 +508,7 @@ impl FluxMode {
         self.header_info.clear();
         self.accumulator = FluxAccumulator::default();
         self.rows.clear();
+        self.json_preview.clear();
         for (i, layer) in self.layers.iter_mut().enumerate() {
             *layer = LayerPlot {
                 name: format!("L{}", i + 1),
@@ -487,16 +555,21 @@ impl FluxMode {
     }
 
     fn read_data(&mut self) {
+        if self.selected_files.is_empty() {
+            self.status_message = "Select raw .txt files first.".to_string();
+            return;
+        }
         self.is_busy = true;
         self.progress_value = 0.0;
         self.accumulator = FluxAccumulator::default();
         self.rows.clear();
+        self.json_preview.clear();
 
-        let output_name = self.output_file_name.clone();
+        let files = self.selected_files.clone();
         let delay_time = self.delay_time;
         let threshold = self.threshold;
         let tx = self.tx.clone();
-        std::thread::spawn(move || read_data_worker(output_name, delay_time, threshold, tx));
+        std::thread::spawn(move || read_data_worker(files, delay_time, threshold, tx));
     }
 
     fn header_check(&mut self) {
@@ -567,6 +640,20 @@ impl FluxMode {
             Err(e) => self.status_message = format!("Failed to export CSV: {e}"),
         }
     }
+
+    /// JSON tab: the decoded rows as JSON withpreview and downloader
+    fn json_tab_ui(&mut self, ui: &mut egui::Ui) {
+        if crate::json_view::json_tab_ui(ui, self.rows.len(), &self.json_preview) {
+            match crate::json_view::save_json("flux_data.json", &flux_rows_json(&self.rows)) {
+                Ok(Some(path)) => {
+                    self.status_message =
+                        format!("Saved {} row(s) to {}", self.rows.len(), path.display())
+                }
+                Ok(None) => {}
+                Err(e) => self.status_message = format!("Failed to save JSON: {e}"),
+            }
+        }
+    }
 }
 
 fn combine_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>) {
@@ -632,23 +719,31 @@ fn process_data_worker(files: Vec<PathBuf>, output_name: String, tx: Sender<Work
     let _ = tx.send(WorkerMsg::Busy(false));
 }
 
-fn read_data_worker(output_name: String, delay_time: i32, threshold: i32, tx: Sender<WorkerMsg>) {
-    let Some(file_path) = io::file_helper::find_excel_file(&output_name, "Flux") else {
-        let _ = tx.send(WorkerMsg::Error(format!(
-            "File not found: {output_name}.xlsx (searched Documents/DSSD_Analysis/Flux and legacy locations)"
-        )));
-        let _ = tx.send(WorkerMsg::Busy(false));
-        return;
-    };
-
-    let rows = match io::excel::read_excel_column_a(&file_path) {
-        Ok(r) => r,
+/// Decodes the selected raw `.txt` files directly (no Excel round-trip):
+/// filters E225 segments, then decodes each into the accumulator + a `FluxRow`
+/// that feeds the Data Table and JSON tabs.
+fn read_data_worker(files: Vec<PathBuf>, delay_time: i32, threshold: i32, tx: Sender<WorkerMsg>) {
+    let rows = match io::segment_filter::filter_e225_segments_from_files(
+        &files,
+        AppConstants::SEGMENT_HEX_LENGTH,
+    ) {
+        Ok(s) => s,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(format!("Error: {e}")));
             let _ = tx.send(WorkerMsg::Busy(false));
             return;
         }
     };
+
+    if rows.is_empty() {
+        let _ = tx.send(WorkerMsg::Status(
+            "No valid E225 segments found.".to_string(),
+            Color32::RED,
+        ));
+        let _ = tx.send(WorkerMsg::Busy(false));
+        return;
+    }
+
     let total_steps = rows.len();
     let _ = tx.send(WorkerMsg::DataCount(total_steps));
 

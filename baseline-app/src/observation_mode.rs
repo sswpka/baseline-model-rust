@@ -75,6 +75,134 @@ struct EventRow {
     line_extra: Arc<[String]>,
 }
 
+/// JSON Structure
+/// `event_group` count keys
+const OBS_JSON_EVENT_COUNT_KEYS: [&str; 18] = [
+    "galactic_electron_count",
+    "albedo_electron_count",
+    "galactic_ion_count",
+    "albedo_ion_count",
+    "l1_ion_threshold",
+    "l1_electron_threshold",
+    "l2_ion_particle",
+    "l2_electron_particle",
+    "l3_ion_particle",
+    "l3_electron_particle",
+    "l4_ion_particle",
+    "l4_electron_particle",
+    "l5_ion_particle",
+    "l5_electron_particle",
+    "l6_ion_particle",
+    "l6_electron_particle",
+    "l7_ion_particle",
+    "l7_electron_particle",
+];
+
+/// tail keys
+const OBS_JSON_TAIL_KEYS: [&str; 12] = [
+    "dssd1_temperature",
+    "fee1_current",
+    "fee1_temperature",
+    "dssd7_temperature",
+    "fee2_current",
+    "fee2_temperature",
+    "fee1_threshold",
+    "fee2_threshold",
+    "bgo1_bias_voltage",
+    "bgo2_bias_voltage",
+    "bgo3_bias_voltage",
+    "bgo2_temperature",
+];
+
+/// Particle events per packet - one JSON object groups this many `event_group`
+/// entries, whereas the CSV emits one row each. Matches
+/// `AppConstants::PARTICLES_PER_LINE`.
+const PARTICLES_PER_PACKET: usize = 5;
+
+fn observation_particle_json(event: &EventRow) -> serde_json::Value {
+    use crate::json_view::{num_or_str, object};
+
+    let extra = |i: usize| {
+        event
+            .line_extra
+            .get(i)
+            .map(|s| num_or_str(s))
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    let mut pairs: Vec<(String, serde_json::Value)> =
+        vec![("particle_time".to_string(), event.particle_time_raw.into())];
+    for (idx, name) in ["l1", "l2", "l6", "l7"].iter().enumerate() {
+        let (x, y) = event.dssd[idx];
+        pairs.push((format!("{name}_xy_position"), event.dssd_position[idx].into()));
+        pairs.push((format!("{name}_x_pulse_height"), x.into()));
+        pairs.push((format!("{name}_y_pulse_height"), y.into()));
+    }
+    for (i, key) in OBS_JSON_EVENT_COUNT_KEYS.iter().enumerate() {
+        pairs.push((key.to_string(), extra(i)));
+    }
+    object(pairs)
+}
+
+fn observation_packet_json(events: &[EventRow]) -> serde_json::Value {
+    use crate::json_view::{num_or_str, object};
+
+    let first = &events[0];
+    let extra = |i: usize| {
+        first
+            .line_extra
+            .get(i)
+            .map(|s| num_or_str(s))
+            .unwrap_or(serde_json::Value::Null)
+    };
+    // Padding/Checksum stay as their raw hex strings, like the other modes'
+    // reserved/checksum fields.
+    let hex_extra = |i: usize| {
+        first
+            .line_extra
+            .get(i)
+            .cloned()
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    let tail = object(
+        OBS_JSON_TAIL_KEYS
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (key.to_string(), extra(18 + i))),
+    );
+
+    object([
+        (
+            "header".to_string(),
+            object([
+                ("packet_sync_code".to_string(), num_or_str(&first.packet_sync)),
+                ("packet_id".to_string(), first.package_id.into()),
+                ("pakcet_seq".to_string(), first.packet_sequence.into()),
+                ("packet_data_len".to_string(), first.packet_data_length.into()),
+                ("time".to_string(), format_event_time(first.time).into()),
+                ("data_type".to_string(), first.data_type.clone().into()),
+            ]),
+        ),
+        (
+            "event_group".to_string(),
+            serde_json::Value::Array(events.iter().map(observation_particle_json).collect()),
+        ),
+        ("tail".to_string(), tail),
+        ("padding".to_string(), hex_extra(30)),
+        ("checksum".to_string(), hex_extra(31)),
+    ])
+}
+
+/// Groups the flat per-particle events into one JSON object per packet.
+fn observation_events_json(events: &[EventRow]) -> Vec<serde_json::Value> {
+    events
+        .chunks(PARTICLES_PER_PACKET)
+        .map(observation_packet_json)
+        .collect()
+}
+
 /// 14-bit ADC channel -> volts
 fn adc_to_volts(channel: i32) -> f64 {
     channel as f64 / 16384.0 * 5.0
@@ -177,6 +305,7 @@ enum DssdDataUnit {
 enum ObservationTab {
     GraphView,
     DataTable,
+    Json,
 }
 
 enum WorkerMsg {
@@ -219,6 +348,8 @@ pub struct ObservationMode {
     /// Data Table tab's event-by-event rows, populated alongside
     /// `histogram_data` by `analyze_files_worker`.
     events: Vec<EventRow>,
+    /// Pretty-printed JSON of the first events, for the JSON tab's preview.
+    json_preview: String,
     dssd_data_unit: DssdDataUnit,
 
     /// Fit/View ROI text fields for the DSSD Pulse Height/X-Strip/Y-Strip
@@ -261,6 +392,7 @@ impl Default for ObservationMode {
             histogram_data: HashMap::new(),
             raw_histogram_data: HashMap::new(),
             events: Vec::new(),
+            json_preview: String::new(),
             dssd_data_unit: DssdDataUnit::Voltage,
             // Full 14-bit DSSD range, matching the original WinForms
             // XaxisMinDSSD/XaxisMaxDSSD defaults.
@@ -451,6 +583,7 @@ impl ObservationMode {
                     ObservationTab::DataTable,
                     "Data Table",
                 );
+                ui.selectable_value(&mut self.active_tab, ObservationTab::Json, "JSON");
             });
             ui.separator();
 
@@ -478,6 +611,7 @@ impl ObservationMode {
                         });
                 }
                 ObservationTab::DataTable => self.data_table_ui(ui),
+                ObservationTab::Json => self.json_tab_ui(ui),
             }
         });
 
@@ -788,6 +922,24 @@ impl ObservationMode {
         }
     }
 
+    /// JSON tab: the decoded events as JSON with preview and a full-file downloader
+    fn json_tab_ui(&mut self, ui: &mut egui::Ui) {
+        let packet_count = self.events.len().div_ceil(PARTICLES_PER_PACKET);
+        if crate::json_view::json_tab_ui(ui, packet_count, &self.json_preview) {
+            match crate::json_view::save_json(
+                "observation_data.json",
+                &observation_events_json(&self.events),
+            ) {
+                Ok(Some(path)) => {
+                    self.status_message =
+                        format!("Saved {packet_count} packet(s) to {}", path.display())
+                }
+                Ok(None) => {}
+                Err(e) => self.status_message = format!("Failed to save JSON: {e}"),
+            }
+        }
+    }
+
     fn histogram_plot(
         &mut self,
         ui: &mut egui::Ui,
@@ -1002,6 +1154,8 @@ impl ObservationMode {
                     self.histogram_data = histogram_data;
                     self.raw_histogram_data = raw_histogram_data;
                     self.data_count_str = events.len().to_string();
+                    self.json_preview =
+                        crate::json_view::preview_string(&observation_events_json(&events));
                     self.events = events;
                     self.fit_cache.clear();
                     self.progress_value = 100.0;
@@ -1024,6 +1178,7 @@ impl ObservationMode {
         self.histogram_data.clear();
         self.raw_histogram_data.clear();
         self.events.clear();
+        self.json_preview.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
         self.status_message = "Ready".to_string();
@@ -1046,6 +1201,7 @@ impl ObservationMode {
         self.histogram_data.clear();
         self.raw_histogram_data.clear();
         self.events.clear();
+        self.json_preview.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
         self.progress_value = 0.0;
@@ -1066,6 +1222,7 @@ impl ObservationMode {
         self.histogram_data.clear();
         self.raw_histogram_data.clear();
         self.events.clear();
+        self.json_preview.clear();
         self.fit_cache.clear();
         self.data_count_str = "-".to_string();
 
@@ -1643,5 +1800,50 @@ fn analyze_files_worker(files: Vec<PathBuf>, tx: Sender<WorkerMsg>, run_id: u64)
                 text: format!("Error! {e}"),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn sample_event(particle_time: i32) -> EventRow {
+        let line_extra: Arc<[String]> = (0..32).map(|i| i.to_string()).collect();
+        EventRow {
+            packet_sync: "E225".to_string(),
+            package_id: 7,
+            packet_sequence: 3,
+            packet_data_length: 247,
+            time: DateTime::from_timestamp(0, 0).unwrap(),
+            data_type: "00AD".to_string(),
+            particle_time_raw: particle_time,
+            dssd_position: [1, 2, 3, 4],
+            dssd: [(10, 11), (12, 13), (14, 15), (16, 17)],
+            bgo: [(0, 0), (0, 0), (0, 0)],
+            line_extra,
+        }
+    }
+
+    #[test]
+    fn one_packet_groups_five_particle_events() {
+        let events: Vec<EventRow> = (0..5).map(sample_event).collect();
+        let packets = observation_events_json(&events);
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        // Header carries no per-particle particle_time.
+        assert!(packet["header"].get("particle_time").is_none());
+        assert_eq!(packet["header"]["packet_id"], serde_json::json!(7));
+
+        let group = packet["event_group"].as_array().unwrap();
+        assert_eq!(group.len(), 5);
+        assert_eq!(group[2]["particle_time"], serde_json::json!(2));
+        assert_eq!(group[0]["l1_x_pulse_height"], serde_json::json!(10));
+        assert_eq!(group[0]["galactic_electron_count"], serde_json::json!(0));
+
+        assert_eq!(packet["tail"]["dssd1_temperature"], serde_json::json!(18));
+        assert_eq!(packet["padding"], serde_json::json!("30"));
+        assert_eq!(packet["checksum"], serde_json::json!("31"));
     }
 }

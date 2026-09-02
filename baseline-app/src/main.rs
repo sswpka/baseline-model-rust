@@ -4,6 +4,7 @@ mod calibration_mode;
 mod channel;
 mod fit_overlay;
 mod flux_mode;
+mod json_view;
 mod observation_mode;
 mod plot_export;
 

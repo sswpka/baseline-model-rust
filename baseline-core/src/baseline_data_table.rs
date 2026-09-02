@@ -64,11 +64,12 @@ pub struct BaselineLineResult {
     pub time: DateTime<Utc>,
     pub data_type: String,
     pub sample_index: i32,
-    /// Blocks of 16 per-channel values, comma-joined, for each layer.
-    pub l1_blocks: Vec<String>,
-    pub l2_blocks: Vec<String>,
-    pub l6_blocks: Vec<String>,
-    pub l7_blocks: Vec<String>,
+    /// Blocks of 16 decoded per-channel values, one `Vec` per sample block,
+    /// for each layer.
+    pub l1_blocks: Vec<Vec<i32>>,
+    pub l2_blocks: Vec<Vec<i32>>,
+    pub l6_blocks: Vec<Vec<i32>>,
+    pub l7_blocks: Vec<Vec<i32>>,
     /// Decoded values for `BASELINE_TAIL_FIELDS`, in that same order.
     pub tail: Vec<String>,
     pub reserved_hex: String,
@@ -87,17 +88,16 @@ fn hex_span(hex_data: &[String], start: usize, len: usize) -> String {
     (start..start + len).map(|i| hex_data.get(i).cloned().unwrap_or_else(|| "00".to_string())).collect()
 }
 
-/// Decodes one 32-byte channel block into its comma-joined list of
-/// `VALUES_PER_BLOCK` (16) per-channel values.
-fn block_values(hex_data: &[String], start: usize) -> String {
+/// Decodes one 32-byte channel block into its `VALUES_PER_BLOCK` (16)
+/// per-channel values.
+fn block_values(hex_data: &[String], start: usize) -> Vec<i32> {
     (0..VALUES_PER_BLOCK)
-        .map(|i| dec_pair(hex_data, start + i * 2).to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .map(|i| dec_pair(hex_data, start + i * 2))
+        .collect()
 }
 
-/// `BLOCKS_PER_LAYER` sample cells for one layer, per `sample_block_offset`.
-fn layer_blocks(hex_data: &[String], layer_base: usize) -> Vec<String> {
+/// `BLOCKS_PER_LAYER` sample blocks for one layer, per `sample_block_offset`.
+fn layer_blocks(hex_data: &[String], layer_base: usize) -> Vec<Vec<i32>> {
     (0..BLOCKS_PER_LAYER)
         .map(|index| block_values(hex_data, sample_block_offset(layer_base, index)))
         .collect()

@@ -55,7 +55,7 @@ pub struct FluxLineResult {
     /// Particle Counts L1-L7 (Byte 18-31), in that order.
     pub particle_counts: Vec<i32>,
     /// Particle Info (Byte 32-2031): `PARTICLE_INFO_COUNT` decoded decimal values.
-    pub particle_info: Vec<String>,
+    pub particle_info: Vec<i32>,
     /// Decoded values for `FLUX_TAIL_FIELDS`, in that same order.
     pub tail: Vec<String>,
     pub reserved_hex: String,
@@ -86,7 +86,7 @@ pub fn parse_flux_line(hex_data: &[String]) -> Option<FluxLineResult> {
         .map(|i| dec_pair(hex_data, PARTICLE_COUNTS_START + i * 2))
         .collect();
     let particle_info = (0..PARTICLE_INFO_COUNT)
-        .map(|i| dec_pair(hex_data, PARTICLE_INFO_START + i * 2).to_string())
+        .map(|i| dec_pair(hex_data, PARTICLE_INFO_START + i * 2))
         .collect();
 
     let tail = FLUX_TAIL_FIELDS
